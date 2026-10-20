@@ -1,4 +1,4 @@
-name: XAUUSD Bot v27
+name: XAUUSD Bot
 
 on:
   schedule:
@@ -44,13 +44,3 @@ jobs:
           RISK_PERCENT:     ${{ secrets.RISK_PERCENT }}
           KILL_SWITCH:      ${{ secrets.KILL_SWITCH }}
         run: python main.py
-
-      - name: Upload run log (opsional, untuk debug)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-log-${{ github.run_id }}
-          path: |
-            ~/.xauusd_state.json
-          retention-days: 7
-          if-no-files-found: ignore
