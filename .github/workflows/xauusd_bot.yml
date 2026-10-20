@@ -1,0 +1,59 @@
+name: XAUUSD Bot
+
+# Jalankan tiap 15 menit (cron GitHub = UTC).
+# Note: cron GH Actions bisa delay 1-5 menit. Kalau butuh presisi,
+# pertimbangkan VPS. Untuk 15m TF, delay ini masih acceptable.
+on:
+  schedule:
+    - cron: '0,15,30,45 * * * *'
+  workflow_dispatch:      # tombol "Run workflow" manual
+
+# Cegah overlap kalau run sebelumnya belum selesai
+concurrency:
+  group: xauusd-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        env:
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_GIST_TOKEN:    ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID:       ${{ secrets.GH_GIST_ID }}
+          ACCOUNT_EQUITY:   ${{ secrets.ACCOUNT_EQUITY }}
+          RISK_PERCENT:     ${{ secrets.RISK_PERCENT }}
+          KILL_SWITCH:      ${{ secrets.KILL_SWITCH }}
+        run: python bot.py
+
+      - name: Upload run log (opsional, untuk debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bot-log-${{ github.run_id }}
+          path: |
+            ~/.xauusd_state.json
+          retention-days: 7
+          if-no-files-found: ignore
