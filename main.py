@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 XAUUSD BOT v27.0 — GitHub Actions Edition (Forensic-Fixed)
+Filename: main.py
 """
 
 import os, sys, json, logging, time as py_time
@@ -269,33 +270,49 @@ def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.Dat
             values = data.get("values", [])
             if not values:
                 raise RuntimeError("TwelveData: empty values")
+            
             df = pd.DataFrame(values)
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
             for c in ["open", "high", "low", "close"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+            
+            # ✅ FIX: Penanganan volume jika tidak disediakan API
+            if "volume" in df.columns:
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+            else:
+                df["volume"] = 0.0
+                
             df = df.sort_values("datetime").reset_index(drop=True)
             df = df[["datetime", "open", "high", "low", "close", "volume"]]
+            
             if len(df) < CONFIG.min_candles:
                 raise RuntimeError(f"TwelveData: only {len(df)} bars")
+            
             log.info("✅ Data: XAU/USD spot (TWELVE_DATA) | %d bars", len(df))
             return df, "TWELVE_DATA_SPOT"
         except Exception as e:
             log.warning("TwelveData attempt %d: %s", attempt, e)
             py_time.sleep(2 ** attempt)
+            
     log.error("❌ TwelveData gagal total, fallback ke Yahoo futures")
     return _fetch_yahoo_futures(interval, bars)
+
 
 def _fetch_yahoo_futures(interval: str = "15m", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
     """Fallback: Yahoo GC=F futures."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     days = max(60, bars // (24 * 4))
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={days}d"
+    
+    # ✅ FIX: Konversi format interval "15min" ke "15m" untuk Yahoo
+    yf_interval = "15m" if interval == "15min" else interval
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={yf_interval}&range={days}d"
+    
     r = requests.get(url, headers=headers, timeout=15)
     r.raise_for_status()
     res = r.json().get("chart", {}).get("result", [])
     if not res or not res[0].get("timestamp"):
         raise RuntimeError("Yahoo GC=F: no data")
+        
     res = res[0]
     q = res.get("indicators", {}).get("quote", [{}])[0]
     df = pd.DataFrame({
@@ -304,6 +321,7 @@ def _fetch_yahoo_futures(interval: str = "15m", bars: int = 5000) -> Tuple[pd.Da
         "low": q.get("low"), "close": q.get("close"),
         "volume": q.get("volume", 0),
     }).dropna(subset=["open", "high", "low", "close"])
+    
     log.warning("⚠️ Menggunakan GC=F FUTURES — harga bukan spot!")
     return df, "YAHOO_FUTURES"
 
