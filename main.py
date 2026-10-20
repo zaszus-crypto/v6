@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD BOT v27.2 — Hybrid ML + Rule-Based Ultimate Edition
+XAUUSD BOT v27.4 — The Ultimate Perfect Edition
 Filename: main.py
 """
 
@@ -39,7 +39,7 @@ def _env_str(k, d=""):
     return (os.getenv(k) or "").strip() or d
 
 # ===========================================================================
-# CONFIG (OPTIMIZED FOR HYBRID ML)
+# CONFIG (FORENSICALLY OPTIMIZED FOR 3-CLASS)
 # ===========================================================================
 @dataclass(frozen=True)
 class Config:
@@ -51,17 +51,17 @@ class Config:
 
     timeframe_minutes: int = 15
     min_candles: int = 300
-    forward_bars: int = 8             # ✅ 2 jam ke depan
+    forward_bars: int = 8             
     atr_period: int = 14
-    atr_sl_multiplier: float = 1.5    # ✅ SL 1.5 ATR
-    risk_reward: float = 2.0          # ✅ TP 2.0 RR
+    atr_sl_multiplier: float = 1.5    
+    risk_reward: float = 2.0          
     spread_usd: float = 0.30
 
-    base_min_signal_probability: float = 0.65  # ✅ Threshold tinggi karena ML digabung Rule
-    max_threshold: float = 0.80
-    min_threshold: float = 0.55
+    # ✅ PERBAIKAN FORENSIK: Threshold 0.38 untuk 3 kelas (Batas acak = 0.33)
+    base_min_signal_probability: float = 0.38
+    max_threshold: float = 0.50
+    min_threshold: float = 0.35
     
-    # ✅ Gate dilonggarkan agar ML mau jalan, karena kita punya Rule-Based Filter
     min_oos_auc: float = 0.45         
     min_oos_precision: float = 0.45   
 
@@ -108,18 +108,12 @@ log = logging.getLogger("xauusd_v27")
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-def validate_config():
-    if CONFIG.account_equity <= 0:
-        raise ValueError(f"ACCOUNT_EQUITY must be > 0")
-    if not (0 < CONFIG.risk_percent <= 100):
-        raise ValueError(f"RISK_PERCENT out of range")
-
 # ===========================================================================
-# STATE MANAGEMENT
+# STATE MANAGEMENT (WITH FORCED THRESHOLD OVERRIDE)
 # ===========================================================================
 def _default_state() -> Dict[str, Any]:
     return {
-        "version": 272,
+        "version": 274, 
         "last_signal_time": None,
         "last_choppy_time": None,
         "daily_signals_count": 0,
@@ -150,6 +144,13 @@ def load_state() -> Dict[str, Any]:
                             state = json.loads(fc["content"])
                             for k, v in default.items():
                                 if k not in state: state[k] = v
+                            
+                            # ✅ FORENSIC FIX: Paksa reset threshold jika Gist menyimpan angka usang (>0.50)
+                            if state.get("adaptive_threshold", 0.60) > 0.50:
+                                log.info("🔄 Gist cache is outdated. Forcing threshold to 0.38")
+                                state["adaptive_threshold"] = CONFIG.base_min_signal_probability
+                                state["version"] = 274
+                                
                             log.info("✅ State loaded from Gist")
                             return state
             except Exception as e:
@@ -519,7 +520,7 @@ def format_message(t: Dict, source: str) -> str:
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v27.2 — Hybrid ML + Rule-Based Ultimate Edition")
+    log.info("XAUUSD v27.4 — The Ultimate Perfect Edition")
     log.info("=" * 60)
     
     state = load_state()
@@ -567,11 +568,12 @@ def main():
     sig_type = "BUY" if pred == 1 else "SELL"
     prob = prob_dict.get(pred, 0.0)
     
+    # ✅ Threshold sekarang 0.38 (Cocok untuk 3 kelas)
     if prob < float(state["adaptive_threshold"]):
         log.info("📉 Prob %.2f < threshold %.2f. Skip.", prob, state["adaptive_threshold"]); return
 
     # =======================================================================
-    # ✅ SMART RULE-BASED FILTER (PENGAMAN TREN & MOMENTUM)
+    # SMART RULE-BASED FILTER (PENGAMAN TREN & MOMENTUM)
     # =======================================================================
     close_price, ema_trend = float(last["close"]), float(last["ema_trend"])
     adx, rsi = float(last["adx"]), float(last["rsi"])
@@ -580,8 +582,11 @@ def main():
         log.info("🛡️ Rule Filter: ML=BUY, but Price < EMA50. Skip."); save_state(state); return
     if sig_type == "SELL" and close_price > ema_trend:
         log.info("🛡️ Rule Filter: ML=SELL, but Price > EMA50. Skip."); save_state(state); return
-    if adx < 22.0:
-        log.info("🛡️ Rule Filter: ADX %.1f < 22 (Sideways). Skip.", adx); save_state(state); return
+    
+    # ADX Filter diturunkan ke 20.0 (Gold sering trending dengan ADX 20-22)
+    if adx < 20.0:
+        log.info("🛡️ Rule Filter: ADX %.1f < 20 (Sideways). Skip.", adx); save_state(state); return
+    
     if sig_type == "BUY" and rsi > 75:
         log.info("🛡️ Rule Filter: RSI %.1f (Overbought). Skip.", rsi); save_state(state); return
     if sig_type == "SELL" and rsi < 25:
