@@ -2,52 +2,24 @@ name: XAUUSD Bot v26
 
 on:
   schedule:
-    # Jalankan setiap 15 menit (UTC). Sesuaikan timezone pasar.
-    # Format: menit jam tanggal bulan hari_dalam_minggu
-    - cron: '*/15 * * * 1-5'  # Senin-Jumat saja (forex tutup weekend)
-  workflow_dispatch:  # Bisa dipicu manual dari tab Actions
-
-# Cegah overlap run jika job sebelumnya masih jalan
-concurrency:
-  group: xauusd-bot
-  cancel-in-progress: false
+    - cron: '*/15 * * * *'   # tiap 15 menit
+  workflow_dispatch:          # bisa manual run
 
 jobs:
-  run-bot:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # Batasi maksimal 10 menit per run
-    
+    timeout-minutes: 10
     steps:
-      - name: 📥 Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: 🐍 Set up Python 3.10
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-          cache: 'pip'
-
-      - name: 📦 Install Dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: 🤖 Run XAUUSD Bot
+      - run: pip install -r requirements.txt
+      - run: python bot.py
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_TOKEN:  ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
-          GH_GIST_ID: ${{ secrets.GH_GIST_ID }}
-          ACCOUNT_EQUITY: ${{ secrets.ACCOUNT_EQUITY }}
-          BACKTEST_MODE: "false"
-        run: python bot.py
-
-      - name: 📤 Upload Logs on Failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: bot-logs-${{ github.run_id }}
-          path: |
-            ~/.xauusd_state.json
-            ~/.xauusd_model_v26.pkl
-          retention-days: 3
+          GH_GIST_TOKEN:   ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID:      ${{ secrets.GH_GIST_ID }}
+          ACCOUNT_EQUITY:  ${{ secrets.ACCOUNT_EQUITY }}
+          BACKTEST_MODE:   "false"
