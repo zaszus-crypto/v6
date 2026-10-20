@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD BOT v26.2 — GitHub Actions Edition (Fixed Choppy Filter)
+XAUUSD BOT v26.3 — GitHub Actions Edition (Optimized for 15m)
 Fix: 
-  1. Perbaikan rumus Hurst & Entropy (hanya hitung 100 bar terakhir -> cepat & akurat).
-  2. Threshold entropy dinaikkan ke 0.99 agar tidak memblokir pasar normal.
-  3. Tambah fallback ticker XAU-USD.
+  1. min_hurst_threshold diturunkan ke 0.30 agar tidak terlalu sensitif skip di timeframe 15m.
+  2. Logging diperjelas untuk transparansi keputusan skip.
 """
 
 import os
@@ -87,10 +86,10 @@ class Config:
     min_oos_auc: float = 0.58
     min_oos_precision: float = 0.55
 
-    # ✅ PERBAIKAN: Threshold yang lebih realistis
-    max_entropy_threshold: float = 0.99  # Naik dari 0.95 (1.0 adalah normal untuk random walk)
-    min_hurst_threshold: float = 0.45    # Naik dari 0.40
-    max_wick_ratio_threshold: float = 0.70
+    # ✅ PERBAIKAN v26.3: Threshold disesuaikan untuk timeframe 15m
+    max_entropy_threshold: float = 0.99  
+    min_hurst_threshold: float = 0.30    # Diturunkan dari 0.45 agar tidak terlalu sering skip
+    max_wick_ratio_threshold: float = 0.75 # Dilonggarkan sedikit untuk menampung wick normal gold
 
     cooldown_minutes: int = 120
     max_daily_signals: int = 6
@@ -133,7 +132,7 @@ def now_utc() -> datetime:
 # ===========================================================================
 def _default_state() -> Dict[str, Any]:
     return {
-        "version": 262,
+        "version": 263,
         "last_signal_time": None,
         "last_choppy_time": None,
         "daily_signals_count": 0,
@@ -245,8 +244,6 @@ def send_telegram(message: str) -> bool:
 # ===========================================================================
 def fetch_xauusd_data(interval: str = "15m", days: int = 60) -> Tuple[pd.DataFrame, str]:
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    
-    # Coba 3 ticker: XAUUSD=X, XAU-USD, GC=F
     tickers_to_try = [
         ("XAUUSD=X", "YAHOO_SPOT"),
         ("XAU-USD", "YAHOO_SPOT_ALT"),
@@ -303,7 +300,6 @@ def wilder_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.ewm(alpha=1 / period, adjust=False).mean()
 
 def hurst_exponent(series, max_lag=20):
-    """Rumus Hurst yang akurat."""
     s = np.asarray(series, dtype=float)
     s = s[np.isfinite(s)]
     if len(s) < max_lag * 2: return 0.5
@@ -317,7 +313,6 @@ def hurst_exponent(series, max_lag=20):
         return 0.5
 
 def shannon_entropy(returns, bins=10):
-    """Rumus Shannon Entropy yang akurat."""
     r = np.asarray(returns, dtype=float)
     r = r[np.isfinite(r)]
     if len(r) < 20: return 1.0
@@ -330,7 +325,6 @@ def shannon_entropy(returns, bins=10):
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     
-    # 1. RSI & ATR
     d = df["close"].diff()
     g = d.clip(lower=0).rolling(14).mean()
     l = (-d.clip(upper=0)).rolling(14).mean()
@@ -340,7 +334,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["atr_pct"] = df["atr"] / (df["close"] + 1e-12)
     df["atr_regime"] = df["atr"] / (df["atr"].rolling(100).mean() + 1e-12)
 
-    # 2. EMA
     df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
     df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
     df["ema_trend"] = df["close"].ewm(span=50, adjust=False).mean()
@@ -348,7 +341,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["ema_slope"] = (df["ema_fast"] - df["ema_fast"].shift(3)) / (df["atr"] + 1e-12)
     df["trend_strength"] = (df["close"] - df["ema_trend"]) / (df["atr"] + 1e-12)
 
-    # 3. ADX
     up, dn = df["high"].diff(), -df["low"].diff()
     pdm = np.where((up > dn) & (up > 0), up, 0.0)
     mdm = np.where((dn > up) & (dn > 0), dn, 0.0)
@@ -358,19 +350,17 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["adx"] = dx.ewm(alpha=1 / CONFIG.atr_period, adjust=False).mean()
     df["di_difference"] = pdi - mdi
 
-    # 4. Bollinger & Keltner
     m, s = df["close"].rolling(20).mean(), df["close"].rolling(20).std()
     df["bb_position"] = (df["close"] - m) / (2 * s + 1e-12)
     km = df["close"].ewm(span=20, adjust=False).mean()
     kb = df["atr"].ewm(span=20, adjust=False).mean() * 2
     df["keltner_position"] = (df["close"] - km) / (kb + 1e-12)
 
-    # 5. Volatility
     ret = df["close"].pct_change()
     df["realized_vol"] = ret.rolling(20).std() * np.sqrt(24 * 60 / CONFIG.timeframe_minutes)
     df["vol_zscore"] = (df["realized_vol"] - df["realized_vol"].rolling(100).mean()) / (df["realized_vol"].rolling(100).std() + 1e-12)
 
-    # ✅ PERBAIKAN: Hitung Hurst & Entropy HANYA untuk 100 bar terakhir (Cepat & Akurat)
+    # Hitung Hurst & Entropy untuk 150 bar terakhir (Cepat & Akurat)
     n = len(df)
     window_size = min(150, n)
     recent_close = df["close"].iloc[-window_size:].values
@@ -382,13 +372,11 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["hurst"] = current_hurst
     df["shannon_entropy"] = current_entropy
 
-    # 6. Candle Structure
     rng = (df["high"] - df["low"]).replace(0, np.nan)
     df["body_ratio"] = (df["close"] - df["open"]).abs() / (rng + 1e-12)
     df["upper_wick_ratio"] = (df["high"] - df[["open", "close"]].max(axis=1)) / (rng + 1e-12)
     df["lower_wick_ratio"] = (df[["open", "close"]].min(axis=1) - df["low"]) / (rng + 1e-12)
 
-    # 7. Market Structure
     sw = 5
     df["prior_high"] = df["high"].rolling(sw).max().shift(1)
     df["prior_low"] = df["low"].rolling(sw).min().shift(1)
@@ -397,7 +385,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["liquidity_sweep_score"] = np.where((df["low"] < df["prior_low"]) & (df["close"] > df["prior_low"]), 1.0,
                                   np.where((df["high"] > df["prior_high"]) & (df["close"] < df["prior_high"]), -1.0, 0.0))
 
-    # 8. Returns & Volume
     df["return_1"] = df["close"].pct_change(1)
     df["return_3"] = df["close"].pct_change(3)
     df["return_5"] = df["close"].pct_change(5)
@@ -410,7 +397,6 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["volume_zscore"], df["volume_ratio"] = 0.0, 1.0
 
-    # 9. Time Features
     hr = df["datetime"].dt.hour
     df["hour_sin"] = np.sin(2 * np.pi * hr / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hr / 24)
@@ -534,7 +520,7 @@ def format_message(trade: Dict, source: str) -> str:
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v26.2 — GitHub Actions Edition")
+    log.info("XAUUSD v26.3 — GitHub Actions Edition")
     log.info("=" * 60)
     log.info("ACCOUNT_EQUITY: $%.2f", CONFIG.account_equity)
 
@@ -601,11 +587,12 @@ def main():
 
     last = df_feat.iloc[-1]
 
-    # ✅ PERBAIKAN: Filter choppy dengan threshold yang sudah diperbaiki
+    # Filter choppy dengan threshold yang sudah dioptimalkan untuk 15m
     entropy = float(last["shannon_entropy"])
     hurst = float(last["hurst"])
     if entropy > CONFIG.max_entropy_threshold or hurst < CONFIG.min_hurst_threshold:
-        log.info("🌊 Pasar choppy/sideways (Entropy=%.2f, Hurst=%.2f). Skip.", entropy, hurst)
+        log.info("🌊 Pasar sideways ekstrem (Entropy=%.2f, Hurst=%.2f < %.2f). Skip.", 
+                 entropy, hurst, CONFIG.min_hurst_threshold)
         state["last_choppy_time"] = now_utc().isoformat()
         save_state(state)
         return
@@ -614,7 +601,7 @@ def main():
     body = abs(float(last["close"] - last["open"]))
     wick = (rng_ - body) / (rng_ + 1e-12) if rng_ > 0 else 1.0
     if wick > CONFIG.max_wick_ratio_threshold:
-        log.info("🕯️ Wick terlalu besar (%.2f). Skip.", wick)
+        log.info("🕯️ Wick terlalu besar (%.2f > %.2f). Skip.", wick, CONFIG.max_wick_ratio_threshold)
         state["last_choppy_time"] = now_utc().isoformat()
         save_state(state)
         return
