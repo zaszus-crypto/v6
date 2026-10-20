@@ -2,18 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 XAUUSD BOT v27.0 — GitHub Actions Edition (Forensic-Fixed)
-=============================================================================
-Fixes vs v26.3:
-  [C1] rolling hurst & entropy (no look-ahead bias)
-  [C2] signal outcome resolver (win/loss tracking)
-  [C3] daily_pnl_usd now actually updates
-  [M4] adaptive threshold based on rolling win-rate
-  [M5] removed invalid ticker XAU-USD
-  [M6] ambiguous barrier hit -> neutral label
-  [M8] GH-Actions-safe state persistence
-  [M9] friday-evening market-close guard
-  [M11..] retries, logging, validation
-=============================================================================
 """
 
 import os, sys, json, logging, time as py_time
@@ -88,7 +76,7 @@ class Config:
     min_lot: float = 0.01
 
     hurst_window: int = 150
-    hurst_stride: int = 5           # compute every 5 bars (ffill) — perf optimization
+    hurst_stride: int = 5
     entropy_window: int = 150
     entropy_stride: int = 5
 
@@ -117,20 +105,13 @@ log = logging.getLogger("xauusd_v27")
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
-# ===========================================================================
-# CONFIG VALIDATION
-# ===========================================================================
 def validate_config():
     if CONFIG.account_equity <= 0:
-        raise ValueError(f"ACCOUNT_EQUITY must be > 0 (got {CONFIG.account_equity})")
+        raise ValueError(f"ACCOUNT_EQUITY must be > 0")
     if not (0 < CONFIG.risk_percent <= 100):
-        raise ValueError(f"RISK_PERCENT out of range (got {CONFIG.risk_percent})")
+        raise ValueError(f"RISK_PERCENT out of range")
     if CONFIG.forward_bars < 1 or CONFIG.forward_bars > 20:
         raise ValueError("forward_bars out of sane range")
-    if CONFIG.atr_sl_multiplier <= 0 or CONFIG.risk_reward <= 0:
-        raise ValueError("SL/TP multipliers must be positive")
-    if not (0 < CONFIG.min_threshold <= CONFIG.base_min_signal_probability <= CONFIG.max_threshold < 1):
-        raise ValueError("threshold band invalid")
 
 # ===========================================================================
 # STATE
@@ -188,8 +169,7 @@ def load_state() -> Dict[str, Any]:
             log.warning("Local state corrupt: %s", e)
 
     if gist_configured:
-        log.error("❌ Gist configured but unreachable. Starting fresh — "
-                  "daily limits may be bypassed. FIX SECRETS/NETWORK.")
+        log.error("❌ Gist configured but unreachable. Starting fresh.")
     else:
         log.info("ℹ️ State default (first run, no persistence configured)")
     return default
@@ -228,7 +208,7 @@ def save_state(state: Dict[str, Any]) -> bool:
         log.warning("Local state save failed: %s", e)
 
     if gist_configured and not saved_gist:
-        log.error("❌ CRITICAL: Gist save failed. Next run may lose state (daily limits risk!).")
+        log.error("❌ CRITICAL: Gist save failed. Next run may lose state!")
     return True
 
 # ===========================================================================
@@ -254,7 +234,6 @@ def send_telegram(message: str) -> bool:
                 continue
             if 500 <= r.status_code < 600:
                 py_time.sleep(2 ** attempt); continue
-            log.error("Telegram hard-fail %d: %s", r.status_code, r.text[:200])
             return False
         except Exception as e:
             log.warning("Telegram attempt %d: %s", attempt, e)
@@ -262,37 +241,71 @@ def send_telegram(message: str) -> bool:
     return False
 
 # ===========================================================================
-# DATA
+# DATA FETCHING (TWELVE DATA)
 # ===========================================================================
-def fetch_xauusd_data(interval: str = "15m", days: int = 60) -> Tuple[pd.DataFrame, str]:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    tickers = [
-        ("XAUUSD=X", "YAHOO_SPOT"),
-        ("GC=F",     "YAHOO_FUTURES"),
-    ]
-    last_err = None
-    for ticker, src in tickers:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval={interval}&range={days}d"
+def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
+    """Twelve Data — spot XAU/USD asli."""
+    api_key = _env_str("TWELVE_DATA_KEY")
+    if not api_key:
+        log.warning("⚠️ TWELVE_DATA_KEY kosong, fallback ke Yahoo GC=F")
+        return _fetch_yahoo_futures(interval, bars)
+
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": "XAU/USD",
+        "interval": interval,
+        "outputsize": min(bars, 5000),
+        "apikey": api_key,
+        "format": "JSON",
+        "timezone": "UTC",
+    }
+    for attempt in range(1, 4):
         try:
-            r = requests.get(url, headers=headers, timeout=15)
+            r = requests.get(url, params=params, timeout=20)
             r.raise_for_status()
-            res = r.json().get("chart", {}).get("result", [])
-            if res and res[0].get("timestamp"):
-                res = res[0]
-                q = res.get("indicators", {}).get("quote", [{}])[0]
-                df = pd.DataFrame({
-                    "datetime": pd.to_datetime(res["timestamp"], unit="s", utc=True),
-                    "open": q.get("open"), "high": q.get("high"),
-                    "low": q.get("low"), "close": q.get("close"),
-                    "volume": q.get("volume", 0),
-                }).dropna(subset=["open","high","low","close"])
-                if len(df) >= CONFIG.min_candles:
-                    log.info("✅ Data: %s (%s) | %d bars", ticker, src, len(df))
-                    return df, src
+            data = r.json()
+            if data.get("status") == "error":
+                raise RuntimeError(f"TwelveData: {data.get('message')}")
+            values = data.get("values", [])
+            if not values:
+                raise RuntimeError("TwelveData: empty values")
+            df = pd.DataFrame(values)
+            df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
+            for c in ["open", "high", "low", "close"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0)
+            df = df.sort_values("datetime").reset_index(drop=True)
+            df = df[["datetime", "open", "high", "low", "close", "volume"]]
+            if len(df) < CONFIG.min_candles:
+                raise RuntimeError(f"TwelveData: only {len(df)} bars")
+            log.info("✅ Data: XAU/USD spot (TWELVE_DATA) | %d bars", len(df))
+            return df, "TWELVE_DATA_SPOT"
         except Exception as e:
-            last_err = e
-            log.warning("%s failed: %s", ticker, e)
-    raise RuntimeError(f"All data sources failed. Last error: {last_err}")
+            log.warning("TwelveData attempt %d: %s", attempt, e)
+            py_time.sleep(2 ** attempt)
+    log.error("❌ TwelveData gagal total, fallback ke Yahoo futures")
+    return _fetch_yahoo_futures(interval, bars)
+
+def _fetch_yahoo_futures(interval: str = "15m", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
+    """Fallback: Yahoo GC=F futures."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    days = max(60, bars // (24 * 4))
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={interval}&range={days}d"
+    r = requests.get(url, headers=headers, timeout=15)
+    r.raise_for_status()
+    res = r.json().get("chart", {}).get("result", [])
+    if not res or not res[0].get("timestamp"):
+        raise RuntimeError("Yahoo GC=F: no data")
+    res = res[0]
+    q = res.get("indicators", {}).get("quote", [{}])[0]
+    df = pd.DataFrame({
+        "datetime": pd.to_datetime(res["timestamp"], unit="s", utc=True),
+        "open": q.get("open"), "high": q.get("high"),
+        "low": q.get("low"), "close": q.get("close"),
+        "volume": q.get("volume", 0),
+    }).dropna(subset=["open", "high", "low", "close"])
+    log.warning("⚠️ Menggunakan GC=F FUTURES — harga bukan spot!")
+    return df, "YAHOO_FUTURES"
 
 def sanitize_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df is None or len(df) < 2: return None
@@ -310,7 +323,7 @@ def sanitize_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     return df if len(df) >= CONFIG.min_candles else None
 
 # ===========================================================================
-# FEATURE ENGINEERING (NO LOOK-AHEAD)
+# FEATURE ENGINEERING
 # ===========================================================================
 def wilder_atr(df, period=14):
     prev = df["close"].shift(1)
@@ -343,7 +356,6 @@ def shannon_entropy(returns: np.ndarray, bins: int = 10) -> float:
     return float(-np.sum(p * np.log2(p)) / mx) if mx > 0 else 1.0
 
 def rolling_hurst(close: np.ndarray, window: int, stride: int, max_lag: int = 20) -> np.ndarray:
-    """Compute hurst on log(price) window ENDING at index i, using only data <= i. No leakage."""
     n = len(close)
     log_s = np.log(np.maximum(close, 1e-10))
     out = np.full(n, np.nan)
@@ -351,19 +363,16 @@ def rolling_hurst(close: np.ndarray, window: int, stride: int, max_lag: int = 20
         win = log_s[i - window + 1 : i + 1]
         out[i] = hurst_exponent(win, max_lag)
     s = pd.Series(out)
-    s = s.ffill().bfill().fillna(0.5)
-    return s.values
+    return s.ffill().bfill().fillna(0.5).values
 
 def rolling_entropy(returns: np.ndarray, window: int, stride: int, bins: int = 10) -> np.ndarray:
-    """Compute entropy on return window ENDING at index i. No leakage."""
     n = len(returns)
     out = np.full(n, np.nan)
     for i in range(window - 1, n, stride):
         win = returns[i - window + 1 : i + 1]
         out[i] = shannon_entropy(win, bins)
     s = pd.Series(out)
-    s = s.ffill().bfill().fillna(1.0)
-    return s.values
+    return s.ffill().bfill().fillna(1.0).values
 
 def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -405,19 +414,8 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["vol_zscore"] = (df["realized_vol"] - df["realized_vol"].rolling(100).mean()) / (
         df["realized_vol"].rolling(100).std() + 1e-12)
 
-    # ✅ FIX C1: rolling hurst & entropy (tidak ada look-ahead)
-    df["hurst"] = rolling_hurst(
-        df["close"].values,
-        window=CONFIG.hurst_window,
-        stride=CONFIG.hurst_stride,
-        max_lag=20,
-    )
-    df["shannon_entropy"] = rolling_entropy(
-        ret.fillna(0).values,
-        window=CONFIG.entropy_window,
-        stride=CONFIG.entropy_stride,
-        bins=10,
-    )
+    df["hurst"] = rolling_hurst(df["close"].values, CONFIG.hurst_window, CONFIG.hurst_stride, 20)
+    df["shannon_entropy"] = rolling_entropy(ret.fillna(0).values, CONFIG.entropy_window, CONFIG.entropy_stride, 10)
 
     rng = (df["high"] - df["low"]).replace(0, np.nan)
     df["body_ratio"] = (df["close"] - df["open"]).abs() / (rng + 1e-12)
@@ -454,13 +452,9 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     df["session_newyork"] = hr.between(12, 20).astype(int)
     df["session_overlap"] = hr.between(12, 15).astype(int)
 
-    # Forward-fill only volume-derived features (safe), then drop the rest
     df[["volume_zscore", "volume_ratio"]] = df[["volume_zscore","volume_ratio"]].ffill().fillna(0)
     return df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
 
-# ===========================================================================
-# LABELS
-# ===========================================================================
 def triple_barrier_labels(df: pd.DataFrame, fwd: int, atr_mult: float) -> pd.DataFrame:
     df = df.copy()
     c = df["close"].values; h = df["high"].values
@@ -468,25 +462,20 @@ def triple_barrier_labels(df: pd.DataFrame, fwd: int, atr_mult: float) -> pd.Dat
     n = len(df)
     labels = np.zeros(n, dtype=int)
     for i in range(n - fwd):
-        if not np.isfinite(a[i]) or a[i] <= 0:
-            continue
+        if not np.isfinite(a[i]) or a[i] <= 0: continue
         up = c[i] + a[i] * atr_mult
         dn = c[i] - a[i] * atr_mult
         for j in range(i + 1, i + fwd + 1):
             hit_up = h[j] >= up
             hit_dn = l[j] <= dn
-            # ✅ FIX M6: ambiguous -> neutral (conservative), tidak bias ke BUY
-            if hit_up and hit_dn:
-                labels[i] = 0; break
-            if hit_up:
-                labels[i] = 1; break
-            if hit_dn:
-                labels[i] = -1; break
+            if hit_up and hit_dn: labels[i] = 0; break
+            if hit_up: labels[i] = 1; break
+            if hit_dn: labels[i] = -1; break
     df["label"] = labels
     return df
 
 # ===========================================================================
-# ML
+# ML ENGINE
 # ===========================================================================
 def build_model():
     rf = RandomForestClassifier(
@@ -525,8 +514,7 @@ def purged_cv(X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
                 y_bin = (y_dir == 1).astype(int)
                 if len(np.unique(y_bin)) >= 2:
                     aucs.append(roc_auc_score(y_bin, proba[dmask][:, bi]))
-        except Exception as e:
-            log.debug("CV fold skipped: %s", e)
+        except Exception:
             continue
     if not aucs:
         return {"valid": False, "auc_mean": 0.5, "prec_mean": 0.0}
@@ -552,11 +540,10 @@ def train_model(df_feat: pd.DataFrame) -> Dict[str, Any]:
     return {"valid": True, "model": model, "auc": wf["auc_mean"]}
 
 # ===========================================================================
-# SIGNAL RESOLUTION  ✅ FIX C2 / C3
+# SIGNAL RESOLUTION
 # ===========================================================================
 def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
-    if not state.get("active_signals"):
-        return
+    if not state.get("active_signals"): return
     now = now_utc()
     still_active, resolved = [], []
 
@@ -565,7 +552,7 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             sig_time = datetime.fromisoformat(sig["time"])
             expires  = datetime.fromisoformat(sig["expires_at"])
         except Exception:
-            continue  # malformed -> discard
+            continue
 
         sig_df = df[df["datetime"] > sig_time]
         outcome = None; exit_price = None
@@ -593,10 +580,8 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             resolved.append((sig, outcome, exit_price, pnl))
 
     for sig, outcome, exit_price, pnl in resolved:
-        if outcome == "win":
-            state["performance_history"]["wins"] += 1
-        elif outcome == "loss":
-            state["performance_history"]["losses"] += 1
+        if outcome == "win": state["performance_history"]["wins"] += 1
+        elif outcome == "loss": state["performance_history"]["losses"] += 1
         state["daily_pnl_usd"] = float(state.get("daily_pnl_usd", 0.0)) + pnl
         state["recent_outcomes"].append({
             "time": sig["time"], "type": sig["type"],
@@ -609,7 +594,6 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
     state["recent_outcomes"] = state["recent_outcomes"][-50:]
     state["active_signals"] = still_active
 
-    # ✅ FIX M4: adaptive threshold
     recent = [o for o in state["recent_outcomes"] if o["outcome"] in ("win","loss")]
     if len(recent) >= 10:
         win_rate = sum(1 for o in recent[-20:] if o["outcome"] == "win") / len(recent[-20:])
@@ -629,9 +613,8 @@ def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float, source: str
     price = float(last["close"]); atr = float(last["atr"])
     sl_dist = atr * CONFIG.atr_sl_multiplier
     tp_dist = sl_dist * CONFIG.risk_reward
-
-    # ✅ FIX M10: spread applied symmetrically
     half_spread = CONFIG.spread_usd / 2.0
+
     if sig_type == "BUY":
         entry = price + half_spread
         sl    = price - sl_dist
@@ -643,8 +626,7 @@ def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float, source: str
 
     risk_usd = CONFIG.account_equity * (CONFIG.risk_percent / 100.0)
     sl_abs = abs(entry - sl)
-    if sl_abs <= 0:
-        lot = CONFIG.min_lot
+    if sl_abs <= 0: lot = CONFIG.min_lot
     else:
         raw = risk_usd / (sl_abs * CONFIG.contract_size)
         lot = max(CONFIG.min_lot, min(round(raw, 2), CONFIG.max_lot))
@@ -694,18 +676,15 @@ def main():
         state["last_reset_date"] = today
         log.info("🔄 Daily state reset")
 
-    # Kill switch (env var OR file)
     if _env_bool(CONFIG.kill_switch_env, False) or os.path.exists(str(Path.home()/".xauusd_kill")):
         log.critical("🛑 Kill switch active. Stop."); return
 
-    # Weekend / Friday-evening guard
     now = now_utc()
     if now.weekday() >= 5:
         log.info("📅 Weekend. Skip."); return
     if now.weekday() == 4 and now.hour >= 21:
         log.info("📅 Friday evening — market closing. Skip."); return
 
-    # Fetch data
     try:
         df, source = fetch_xauusd_data()
         df = sanitize_df(df)
@@ -716,14 +695,12 @@ def main():
 
     state["last_data_source"] = source
 
-    # ✅ FIX C2/C3: resolve old signals BEFORE checking limits
     try:
         resolve_active_signals(state, df)
     except Exception as e:
         log.error("❌ Resolution failed: %s", e, exc_info=True)
     save_state(state)
 
-    # Daily limits (now real)
     if state["daily_signals_count"] >= CONFIG.max_daily_signals:
         log.info("⛔ Max daily signals reached (%d).", CONFIG.max_daily_signals); return
 
@@ -732,7 +709,6 @@ def main():
         log.critical("🛑 Daily loss limit reached ($%.2f <= -$%.2f).",
                      state["daily_pnl_usd"], max_loss); return
 
-    # Cooldown
     if state.get("last_signal_time"):
         try:
             mins = (now_utc() - datetime.fromisoformat(state["last_signal_time"])).total_seconds() / 60
@@ -741,7 +717,6 @@ def main():
         except Exception:
             pass
 
-    # Features
     try:
         df_feat = calculate_features(df)
     except Exception as e:
@@ -764,7 +739,6 @@ def main():
         log.info("🕯️ Excessive wick (%.2f > %.2f). Skip.", wick, CONFIG.max_wick_ratio_threshold)
         state["last_choppy_time"] = now_utc().isoformat(); save_state(state); return
 
-    # Train & predict
     try:
         models = train_model(df_feat)
     except Exception as e:
