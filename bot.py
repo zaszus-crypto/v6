@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD BOT v28.0 — Perfect Union Edition
-==========================================
-Kolaborasi v26.5 (production hardening) + v27.4 (TwelveData, 3-class, rule filter)
+XAUUSD BOT v28.1 — FINAL DEFINITIVE EDITION
+=============================================
+Satu file, siap deploy, tidak perlu edit lagi.
 
-Perbaikan kunci dari v27.4:
-  ✅ min_candles 300 → 600 (training cukup)
-  ✅ Model caching (TTL 6 jam) — hemat compute
-  ✅ PnL aktual (lot × Δ × contract_size), bukan risk_usd rounded
-  ✅ Stale data check di sanitize_df
-  ✅ Yahoo fallback dengan error handling lengkap
-  ✅ active_signals trim max 20
-  ✅ Market hours akurat (Jumat 21:00 UTC, Minggu 22:00 UTC)
-  ✅ Migrasi state otomatis (v26.5 → v28.0)
-  ✅ Timeout PnL guard (sig_df kosong)
-  ✅ Kill switch: env var + file-based
-  ✅ min_oos_auc 0.45 → 0.50 (tolak model < random)
-  ✅ spread_usd terpakai, tidak hardcoded
+Fitur:
+  ✅ TwelveData spot + Yahoo fallback berlapis
+  ✅ 3-class ML (BUY/SELL/NEUTRAL) + rule filter (EMA50, ADX, RSI)
+  ✅ Rolling Hurst/Entropy per bar
+  ✅ Model caching (TTL 6 jam)
+  ✅ Signal lifecycle resolution SEBELUM cooldown (PnL akurat)
+  ✅ Adaptive threshold berbasis win-rate
+  ✅ DIAGNOSTIC_MODE built-in (bypass semua gate, tidak kirim Telegram)
+  ✅ Migrasi state otomatis dari versi lama
+  ✅ PnL aktual (lot × Δprice × contract_size)
+  ✅ Kill switch: env var + file
+  ✅ Market hours akurat
+  ✅ Stale data protection
 """
 
 import os
@@ -29,7 +29,7 @@ import time as py_time
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Dict, Any, Tuple, Optional, List
+from typing import Dict, Any, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -81,9 +81,10 @@ class Config:
     gist_token: str = _env_str("GH_GIST_TOKEN")
     gist_id: str = _env_str("GH_GIST_ID")
     backtest_mode: bool = _env_bool("BACKTEST_MODE", False)
+    diagnostic_mode: bool = _env_bool("DIAGNOSTIC_MODE", False)
 
     timeframe_minutes: int = 15
-    min_candles: int = 600              # ✅ FIX v28: dari 300
+    min_candles: int = 600
     forward_bars: int = 8
     atr_period: int = 14
     atr_sl_multiplier: float = 1.5
@@ -91,12 +92,11 @@ class Config:
     spread_usd: float = 0.30
     slippage_usd: float = 0.10
 
-    # ✅ Threshold 3-class (random=0.33)
     base_min_signal_probability: float = 0.38
     max_threshold: float = 0.50
     min_threshold: float = 0.35
 
-    min_oos_auc: float = 0.50            # ✅ FIX v28: dari 0.45
+    min_oos_auc: float = 0.50
     min_oos_precision: float = 0.45
 
     max_entropy_threshold: float = 0.99
@@ -157,21 +157,21 @@ def now_utc() -> datetime:
 def is_market_open() -> bool:
     now = now_utc()
     wd, hr = now.weekday(), now.hour
-    if wd == 5:                      # Sabtu
+    if wd == 5:
         return False
-    if wd == 6 and hr < 22:          # Minggu sebelum 22:00 UTC
+    if wd == 6 and hr < 22:
         return False
-    if wd == 4 and hr >= 21:         # Jumat setelah 21:00 UTC
+    if wd == 4 and hr >= 21:
         return False
     return True
 
 
 # ===========================================================================
-# STATE MANAGEMENT (dengan migrasi otomatis)
+# STATE MANAGEMENT
 # ===========================================================================
 def _default_state() -> Dict[str, Any]:
     return {
-        "version": 280,
+        "version": 281,
         "last_signal_time": None,
         "last_choppy_time": None,
         "last_run_time": None,
@@ -187,39 +187,31 @@ def _default_state() -> Dict[str, Any]:
 
 
 def _migrate_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Migrasi state dari versi lama (v26.5/v27.4) ke v28.0."""
     default = _default_state()
     for k, v in default.items():
         if k not in state:
             state[k] = v
 
-    # Migrasi recent_outcomes: string → dict
     ro = state.get("recent_outcomes", [])
     if ro and isinstance(ro[0], str):
         log.info("🔄 Migrasi recent_outcomes string → dict")
         state["recent_outcomes"] = [{"outcome": o, "prob": 0.0} for o in ro]
 
-    # Migrasi performance_history: tambah timeouts
     ph = state.get("performance_history", {})
     if "timeouts" not in ph:
         ph["timeouts"] = 0
         state["performance_history"] = ph
 
-    # Migrasi active_signals: pastikan list
     if not isinstance(state.get("active_signals"), list):
         state["active_signals"] = []
 
-    # Threshold out-of-range → reset
     th = state.get("adaptive_threshold", CONFIG.base_min_signal_probability)
     if not isinstance(th, (int, float)) or not (
         CONFIG.min_threshold <= float(th) <= CONFIG.max_threshold
     ):
-        log.info("🔄 Threshold out-of-range (%.3f) → reset ke %.3f",
-                 float(th) if isinstance(th, (int, float)) else 0.0,
-                 CONFIG.base_min_signal_probability)
         state["adaptive_threshold"] = CONFIG.base_min_signal_probability
 
-    state["version"] = 280
+    state["version"] = 281
     return state
 
 
@@ -241,7 +233,7 @@ def load_state() -> Dict[str, Any]:
                                 log.info("✅ State loaded from Gist")
                                 return state
                             except json.JSONDecodeError:
-                                log.warning("Gist state JSON corrupt")
+                                log.warning("Gist state corrupt")
             except Exception as e:
                 log.warning("Gist load attempt %d: %s", attempt, e)
                 py_time.sleep(2 ** attempt)
@@ -255,7 +247,7 @@ def load_state() -> Dict[str, Any]:
         except Exception as e:
             log.warning("Local state corrupt: %s", e)
 
-    log.info("ℹ️ State default digunakan (pertama kali run)")
+    log.info("ℹ️ State default (first run)")
     return _default_state()
 
 
@@ -287,9 +279,9 @@ def save_state(state: Dict[str, Any]) -> bool:
             json.dump(state, f, indent=2)
         os.replace(tmp, CONFIG.state_path)
         if not saved_gist:
-            log.info("✅ State saved to local file (fallback)")
+            log.info("✅ State saved to local (fallback)")
     except Exception as e:
-        log.warning("Local state save failed: %s", e)
+        log.warning("Local save failed: %s", e)
     return True
 
 
@@ -298,10 +290,10 @@ def save_state(state: Dict[str, Any]) -> bool:
 # ===========================================================================
 def send_telegram(message: str) -> bool:
     if CONFIG.backtest_mode:
-        log.info("📨 [BACKTEST] Telegram suppressed: %s", message.split("\n")[0])
+        log.info("📨 [BACKTEST] Telegram suppressed")
         return True
     if not CONFIG.telegram_token or not CONFIG.telegram_chat_id:
-        log.warning("⚠️ Telegram tidak terkonfigurasi")
+        log.warning("⚠️ Telegram not configured")
         return False
     url = f"https://api.telegram.org/bot{CONFIG.telegram_token}/sendMessage"
     payload = {
@@ -335,10 +327,9 @@ def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.Dat
         try:
             return _fetch_twelvedata(api_key, interval, bars)
         except Exception as e:
-            log.warning("TwelveData gagal sepenuhnya: %s. Fallback Yahoo.", e)
+            log.warning("TwelveData failed: %s. Fallback Yahoo.", e)
     else:
-        log.info("ℹ️ TWELVE_DATA_KEY tidak ada, langsung Yahoo.")
-
+        log.info("ℹ️ No TWELVE_DATA_KEY, using Yahoo")
     return _fetch_yahoo_futures(interval, bars)
 
 
@@ -377,14 +368,12 @@ def _fetch_twelvedata(api_key: str, interval: str, bars: int) -> Tuple[pd.DataFr
         except Exception as e:
             log.warning("TwelveData attempt %d: %s", attempt, e)
             py_time.sleep(2 ** attempt)
-    raise RuntimeError("TwelveData gagal setelah 3 percobaan")
+    raise RuntimeError("TwelveData failed after 3 attempts")
 
 
 def _fetch_yahoo_futures(interval: str, bars: int) -> Tuple[pd.DataFrame, str]:
-    """✅ FIX v28: proper error handling, no unhandled crash."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     yf_interval = "15m" if interval == "15min" else interval
-    # Fallback: spot dulu, lalu futures
     tickers = [("XAUUSD=X", "YAHOO_SPOT"), ("GC=F", "YAHOO_FUTURES")]
     for ticker, src in tickers:
         url = (
@@ -396,7 +385,6 @@ def _fetch_yahoo_futures(interval: str, bars: int) -> Tuple[pd.DataFrame, str]:
             r.raise_for_status()
             chart = r.json().get("chart", {}).get("result", [])
             if not chart or not chart[0].get("timestamp"):
-                log.warning("%s: no data", ticker)
                 continue
             res = chart[0]
             q = res.get("indicators", {}).get("quote", [{}])[0]
@@ -411,36 +399,27 @@ def _fetch_yahoo_futures(interval: str, bars: int) -> Tuple[pd.DataFrame, str]:
             if len(df) >= CONFIG.min_candles:
                 log.info("✅ Data: %s (%s) | %d bars", ticker, src, len(df))
                 return df, src
-            log.warning("%s hanya %d bar < %d", ticker, len(df), CONFIG.min_candles)
         except Exception as e:
-            log.warning("%s gagal: %s", ticker, e)
-    raise RuntimeError("Semua sumber data gagal")
+            log.warning("%s failed: %s", ticker, e)
+    raise RuntimeError("All data sources failed")
 
 
 def sanitize_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """✅ FIX v28: tambah stale check."""
     if df is None or len(df) < 2:
-        log.warning("sanitize: df kosong")
         return None
-
-    raw_n = len(df)
     df = df.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
     df = df[(df["high"] >= df["low"]) & (df["close"] > 0) & (df["open"] > 0)]
     df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["open", "high", "low", "close"])
     if len(df) == 0:
-        log.warning("sanitize: semua bar invalid")
         return None
-
     age = (now_utc() - df["datetime"].iloc[-1]).total_seconds() / 60
-    # ✅ FIX v28: data stale = >3x timeframe → tolak
     if age > CONFIG.timeframe_minutes * 3:
-        log.warning("⚠️ Data stale (%.0f min > %d min)", age, CONFIG.timeframe_minutes * 3)
+        log.warning("⚠️ Data stale (%.0f min)", age)
         return None
     if age < CONFIG.timeframe_minutes:
         df = df.iloc[:-1].reset_index(drop=True)
-
     if len(df) < CONFIG.min_candles:
-        log.warning("sanitize: %d bar < %d (raw=%d)", len(df), CONFIG.min_candles, raw_n)
+        log.warning("sanitize: %d bars < %d", len(df), CONFIG.min_candles)
         return None
     return df
 
@@ -610,7 +589,7 @@ def triple_barrier_labels(df: pd.DataFrame, fwd: int, atr_mult: float) -> pd.Dat
 
 
 # ===========================================================================
-# ML ENGINE (dengan model caching)
+# ML ENGINE
 # ===========================================================================
 def build_model() -> VotingClassifier:
     rf = RandomForestClassifier(
@@ -650,7 +629,7 @@ def purged_cv(X: np.ndarray, y: np.ndarray) -> Dict[str, float]:
                 if len(np.unique(y_bin)) >= 2:
                     aucs.append(roc_auc_score(y_bin, proba[dmask][:, bi]))
         except Exception as e:
-            log.debug("purged_cv fold: %s", e)
+            log.debug("CV fold error: %s", e)
             continue
     if not aucs:
         return {"valid": False, "auc_mean": 0.5, "prec_mean": 0.0}
@@ -676,7 +655,7 @@ def _load_cached_model() -> Optional[VotingClassifier]:
         log.info("✅ Model loaded from cache")
         return model
     except Exception as e:
-        log.warning("Model cache load gagal: %s", e)
+        log.warning("Cache load failed: %s", e)
         return None
 
 
@@ -686,7 +665,7 @@ def _save_cached_model(model: VotingClassifier) -> None:
             pickle.dump(model, f)
         log.info("✅ Model cached")
     except Exception as e:
-        log.warning("Model cache save gagal: %s", e)
+        log.warning("Cache save failed: %s", e)
 
 
 def train_model(df_feat: pd.DataFrame) -> Dict[str, Any]:
@@ -699,34 +678,29 @@ def train_model(df_feat: pd.DataFrame) -> Dict[str, Any]:
     X, y = train_df[FEATURES].values, train_df["label"].values
     if len(X) < 400 or len(np.unique(y)) < 2:
         return {"valid": False,
-                "reason": f"insufficient_data (n={len(X)}, cls={len(np.unique(y))})"}
+                "reason": f"insufficient_data n={len(X)} cls={len(np.unique(y))}"}
 
     wf = purged_cv(X, y)
     if not wf["valid"]:
-        return {"valid": False, "reason": "wf_invalid"}
+        return {"valid": False, "reason": "cv_invalid"}
     if wf["auc_mean"] < CONFIG.min_oos_auc or wf["prec_mean"] < CONFIG.min_oos_precision:
         return {"valid": False,
-                "reason": f"wf_gate AUC={wf['auc_mean']:.3f} P={wf['prec_mean']:.3f}"}
-    if wf["auc_mean"] < 0.55:
-        log.warning("⚠️ Model marginal: AUC=%.3f (min=%.2f)", wf["auc_mean"], CONFIG.min_oos_auc)
+                "reason": f"gate AUC={wf['auc_mean']:.3f} P={wf['prec_mean']:.3f}"}
 
     weights = np.exp(-np.arange(len(y))[::-1] / 500.0)
     model = build_model()
     model.fit(X, y, sample_weight=weights)
     _save_cached_model(model)
     log.info("🎓 Model trained | AUC=%.3f P=%.3f n=%d", wf["auc_mean"], wf["prec_mean"], len(X))
-    return {"valid": True, "model": model, "cached": False,
-            "auc": wf["auc_mean"], "prec": wf["prec_mean"]}
+    return {"valid": True, "model": model, "cached": False, "auc": wf["auc_mean"]}
 
 
 # ===========================================================================
-# SIGNAL LIFECYCLE
+# SIGNAL LIFECYCLE (dipanggil SEBELUM cooldown check)
 # ===========================================================================
 def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
-    """✅ FIX v28: guard empty sig_df, PnL aktual, update adaptive threshold."""
     if not state.get("active_signals"):
         return
-
     now, still_active, resolved = now_utc(), [], []
 
     for sig in state["active_signals"]:
@@ -737,7 +711,7 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             lot = float(sig["lot"])
             side = sig["type"]
         except (KeyError, ValueError, TypeError):
-            log.warning("Signal corrupt, skip: %s", sig.get("time", "?"))
+            log.warning("Corrupt signal, skip")
             continue
 
         sig_df = df[df["datetime"] > sig_time]
@@ -762,7 +736,6 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
 
         if outcome is None:
             if now >= expires:
-                # ✅ FIX v28: guard sig_df kosong
                 if len(sig_df) > 0:
                     exit_price = float(sig_df["close"].iloc[-1])
                     pnl = ((exit_price - entry) if side == "BUY"
@@ -774,11 +747,8 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             else:
                 still_active.append(sig)
         else:
-            # ✅ FIX v28: PnL aktual, bukan risk_usd rounded
-            if side == "BUY":
-                pnl = (exit_price - entry) * lot * CONFIG.contract_size
-            else:
-                pnl = (entry - exit_price) * lot * CONFIG.contract_size
+            pnl = ((exit_price - entry) if side == "BUY"
+                   else (entry - exit_price)) * lot * CONFIG.contract_size
             resolved.append((sig, outcome, exit_price, pnl))
 
     for sig, outcome, exit_price, pnl in resolved:
@@ -802,19 +772,18 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
     state["recent_outcomes"] = state["recent_outcomes"][-50:]
     state["active_signals"] = still_active
 
-    # Adaptive threshold
     recent = [o for o in state["recent_outcomes"] if o["outcome"] in ("win", "loss")]
     if len(recent) >= 10:
-        recent_20 = recent[-20:]
-        win_rate = sum(1 for o in recent_20 if o["outcome"] == "win") / len(recent_20)
+        r20 = recent[-20:]
+        win_rate = sum(1 for o in r20 if o["outcome"] == "win") / len(r20)
         new_th = float(np.clip(
             CONFIG.base_min_signal_probability + (0.55 - win_rate) * 0.5,
             CONFIG.min_threshold, CONFIG.max_threshold))
         old_th = state["adaptive_threshold"]
         if abs(new_th - old_th) > 0.005:
             state["adaptive_threshold"] = round(new_th, 4)
-            log.info("🎚️ Adaptive threshold: %.3f → %.3f (win_rate=%.2f, n=%d)",
-                     old_th, new_th, win_rate, len(recent_20))
+            log.info("🎚️ Threshold %.3f → %.3f (win_rate=%.2f n=%d)",
+                     old_th, new_th, win_rate, len(r20))
 
 
 # ===========================================================================
@@ -825,7 +794,7 @@ def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float, source: str
     price, atr = float(last["close"]), float(last["atr"])
     sl_dist = atr * CONFIG.atr_sl_multiplier
     tp_dist = sl_dist * CONFIG.risk_reward
-    half_spread = CONFIG.spread_usd / 2  # ✅ FIX v28: tidak hardcoded 0.15
+    half_spread = CONFIG.spread_usd / 2
 
     if sig_type == "BUY":
         entry = price + half_spread
@@ -881,9 +850,13 @@ def format_message(t: Dict, source: str) -> str:
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v28.0 — Perfect Union Edition")
+    log.info("XAUUSD v28.1 — FINAL DEFINITIVE EDITION")
     log.info("=" * 60)
     log.info("ACCOUNT_EQUITY: $%.2f", CONFIG.account_equity)
+
+    _diag = CONFIG.diagnostic_mode
+    if _diag:
+        log.warning("🔬 DIAGNOSTIC MODE — gates bypassed, no Telegram")
 
     if CONFIG.account_equity <= 0:
         log.critical("🛑 ACCOUNT_EQUITY invalid")
@@ -897,33 +870,20 @@ def main():
         state["last_reset_date"] = today
         log.info("🔄 Daily state reset")
 
-    if _env_bool(CONFIG.kill_switch_env, False) or os.path.exists(CONFIG.kill_switch_path):
-        log.critical("🛑 Kill switch aktif")
-        return
+    # -----------------------------------------------------------------------
+    # PHASE 1: Cheap checks (no data needed)
+    # -----------------------------------------------------------------------
+    if not _diag:
+        if _env_bool(CONFIG.kill_switch_env, False) or os.path.exists(CONFIG.kill_switch_path):
+            log.critical("🛑 Kill switch active")
+            return
+        if not is_market_open():
+            log.info("📅 Market closed")
+            return
 
-    if not is_market_open():
-        log.info("📅 Market closed. Skip.")
-        return
-
-    if state["daily_signals_count"] >= CONFIG.max_daily_signals:
-        log.info("⛔ Batas sinyal harian (%d)", CONFIG.max_daily_signals)
-        return
-
-    max_loss = CONFIG.max_daily_loss_pct * CONFIG.account_equity / 100.0
-    if state.get("daily_pnl_usd", 0) <= -max_loss:
-        log.critical("🛑 Daily loss limit ($%.2f)", state["daily_pnl_usd"])
-        return
-
-    if state.get("last_signal_time"):
-        try:
-            mins = (now_utc() - datetime.fromisoformat(
-                state["last_signal_time"])).total_seconds() / 60
-            if mins < CONFIG.cooldown_minutes:
-                log.info("⏳ Cooldown aktif (%.0f/%d min)", mins, CONFIG.cooldown_minutes)
-                return
-        except Exception:
-            pass
-
+    # -----------------------------------------------------------------------
+    # PHASE 2: Fetch data (needed for signal resolution)
+    # -----------------------------------------------------------------------
     try:
         df, source = fetch_xauusd_data()
         df = sanitize_df(df)
@@ -936,12 +896,41 @@ def main():
     state["last_data_source"] = source
     state["last_run_time"] = now_utc().isoformat()
 
-    # Resolve sinyal & update adaptive threshold
+    # -----------------------------------------------------------------------
+    # PHASE 3: Resolve active signals (SEBELUM cooldown — fix v28.1)
+    # -----------------------------------------------------------------------
     try:
         resolve_active_signals(state, df)
     except Exception as e:
-        log.warning("Resolve signals error: %s", e)
+        log.warning("Resolve error: %s", e)
 
+    # -----------------------------------------------------------------------
+    # PHASE 4: Cooldown + daily limits (setelah resolution)
+    # -----------------------------------------------------------------------
+    if not _diag:
+        if state["daily_signals_count"] >= CONFIG.max_daily_signals:
+            log.info("⛔ Daily signal limit (%d)", CONFIG.max_daily_signals)
+            save_state(state)
+            return
+        max_loss = CONFIG.max_daily_loss_pct * CONFIG.account_equity / 100.0
+        if state.get("daily_pnl_usd", 0) <= -max_loss:
+            log.critical("🛑 Daily loss limit ($%.2f)", state["daily_pnl_usd"])
+            save_state(state)
+            return
+        if state.get("last_signal_time"):
+            try:
+                mins = (now_utc() - datetime.fromisoformat(
+                    state["last_signal_time"])).total_seconds() / 60
+                if mins < CONFIG.cooldown_minutes:
+                    log.info("⏳ Cooldown aktif (%.0f/%d min)", mins, CONFIG.cooldown_minutes)
+                    save_state(state)
+                    return
+            except Exception:
+                pass
+
+    # -----------------------------------------------------------------------
+    # PHASE 5: Feature engineering
+    # -----------------------------------------------------------------------
     try:
         df_feat = calculate_features(df)
     except Exception as e:
@@ -950,7 +939,7 @@ def main():
         return
 
     if len(df_feat) < 100:
-        log.warning("⚠️ Fitur terlalu sedikit (%d)", len(df_feat))
+        log.warning("⚠️ Too few features (%d)", len(df_feat))
         save_state(state)
         return
 
@@ -959,8 +948,8 @@ def main():
     # Choppy filter
     entropy = float(last["shannon_entropy"])
     hurst = float(last["hurst"])
-    if entropy > CONFIG.max_entropy_threshold or hurst < CONFIG.min_hurst_threshold:
-        log.info("🌊 Choppy (Entropy=%.2f, Hurst=%.2f). Skip", entropy, hurst)
+    if not _diag and (entropy > CONFIG.max_entropy_threshold or hurst < CONFIG.min_hurst_threshold):
+        log.info("🌊 Choppy (Ent=%.2f Hurst=%.2f)", entropy, hurst)
         state["last_choppy_time"] = now_utc().isoformat()
         save_state(state)
         return
@@ -969,13 +958,15 @@ def main():
     rng_ = float(last["high"] - last["low"])
     body = abs(float(last["close"] - last["open"]))
     wick = (rng_ - body) / (rng_ + 1e-12) if rng_ > 0 else 1.0
-    if wick > CONFIG.max_wick_ratio_threshold:
-        log.info("🕯️ Wick %.2f > %.2f. Skip", wick, CONFIG.max_wick_ratio_threshold)
+    if not _diag and wick > CONFIG.max_wick_ratio_threshold:
+        log.info("🕯️ Wick %.2f > %.2f", wick, CONFIG.max_wick_ratio_threshold)
         state["last_choppy_time"] = now_utc().isoformat()
         save_state(state)
         return
 
-    # Train / load model
+    # -----------------------------------------------------------------------
+    # PHASE 6: Train / load model
+    # -----------------------------------------------------------------------
     models = train_model(df_feat)
     if not models.get("valid"):
         log.info("⚠️ Model invalid: %s", models.get("reason"))
@@ -983,11 +974,13 @@ def main():
         return
 
     if models.get("cached"):
-        log.info("ℹ️ Menggunakan model cache")
+        log.info("ℹ️ Model from cache")
     else:
-        log.info("🧠 Model baru dilatih | AUC=%.3f", models.get("auc", 0.0))
+        log.info("🧠 Model trained | AUC=%.3f", models.get("auc", 0.0))
 
-    # Inference
+    # -----------------------------------------------------------------------
+    # PHASE 7: Inference
+    # -----------------------------------------------------------------------
     X_live = last[FEATURES].values.reshape(1, -1)
     model = models["model"]
     pred = int(model.predict(X_live)[0])
@@ -1006,48 +999,62 @@ def main():
     prob = prob_dict.get(pred, 0.0)
     th = float(state["adaptive_threshold"])
 
-    if prob < th:
+    if not _diag and prob < th:
         log.info("📉 Prob %.3f < threshold %.3f", prob, th)
         save_state(state)
         return
 
-    # =======================================================================
-    # SMART RULE-BASED FILTER
-    # =======================================================================
+    # -----------------------------------------------------------------------
+    # PHASE 8: Rule-based filter
+    # -----------------------------------------------------------------------
     close_price = float(last["close"])
     ema_trend = float(last["ema_trend"])
     adx = float(last["adx"])
     rsi = float(last["rsi"])
 
-    if sig_type == "BUY" and close_price < ema_trend:
-        log.info("🛡️ ML=BUY tapi price<EMA50. Skip")
-        save_state(state)
-        return
-    if sig_type == "SELL" and close_price > ema_trend:
-        log.info("🛡️ ML=SELL tapi price>EMA50. Skip")
-        save_state(state)
-        return
-    if adx < 20.0:
-        log.info("🛡️ ADX %.1f < 20 (sideways). Skip", adx)
-        save_state(state)
-        return
-    if sig_type == "BUY" and rsi > 75:
-        log.info("🛡️ RSI %.1f overbought. Skip", rsi)
-        save_state(state)
-        return
-    if sig_type == "SELL" and rsi < 25:
-        log.info("🛡️ RSI %.1f oversold. Skip", rsi)
-        save_state(state)
-        return
+    if not _diag:
+        if sig_type == "BUY" and close_price < ema_trend:
+            log.info("🛡️ BUY but price<EMA50, skip")
+            save_state(state)
+            return
+        if sig_type == "SELL" and close_price > ema_trend:
+            log.info("🛡️ SELL but price>EMA50, skip")
+            save_state(state)
+            return
+        if adx < 20.0:
+            log.info("🛡️ ADX %.1f < 20", adx)
+            save_state(state)
+            return
+        if sig_type == "BUY" and rsi > 75:
+            log.info("🛡️ RSI %.1f overbought", rsi)
+            save_state(state)
+            return
+        if sig_type == "SELL" and rsi < 25:
+            log.info("🛡️ RSI %.1f oversold", rsi)
+            save_state(state)
+            return
 
-    log.info("🔥 CONFIRMED | %s prob=%.3f ADX=%.1f RSI=%.1f", sig_type, prob, adx, rsi)
+    log.info("🔥 CONFIRMED | %s prob=%.3f ADX=%.1f RSI=%.1f",
+             sig_type, prob, adx, rsi)
 
-    # Compute & send
+    # -----------------------------------------------------------------------
+    # PHASE 9: Compute trade + send (or diagnostic output)
+    # -----------------------------------------------------------------------
     try:
         trade = compute_trade(sig_type, df_feat, prob, source)
     except Exception as e:
         log.error("❌ compute_trade: %s", e)
         save_state(state)
+        return
+
+    if _diag:
+        log.info("🔬 DIAGNOSTIC — signal that WOULD be sent:")
+        for line in format_message(trade, source).split("\n"):
+            clean = line.replace("<b>", "").replace("</b>", "").replace(
+                "<i>", "").replace("</i>", "").strip()
+            if clean:
+                log.info("    %s", clean)
+        log.info("🔬 DIAGNOSTIC — state NOT modified")
         return
 
     if not send_telegram(format_message(trade, source)):
