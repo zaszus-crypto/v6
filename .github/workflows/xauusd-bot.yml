@@ -1,14 +1,14 @@
-name: XAUUSD Bot v26
+name: XAUUSD Bot v28
 
 on:
   schedule:
-    - cron: '*/15 * * * *'   # tiap 15 menit
-  workflow_dispatch:          # bisa manual run
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,9 +17,10 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python bot.py
         env:
-          TELEGRAM_TOKEN:  ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          GH_GIST_TOKEN:   ${{ secrets.GH_GIST_TOKEN }}
-          GH_GIST_ID:      ${{ secrets.GH_GIST_ID }}
-          ACCOUNT_EQUITY:  ${{ secrets.ACCOUNT_EQUITY }}
-          BACKTEST_MODE:   "false"
+          TELEGRAM_TOKEN:    ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_GIST_TOKEN:     ${{ secrets.GH_GIST_TOKEN }}
+          GH_GIST_ID:        ${{ secrets.GH_GIST_ID }}
+          TWELVE_DATA_KEY:   ${{ secrets.TWELVE_DATA_KEY }}
+          ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY }}
+          BACKTEST_MODE:     "false"
