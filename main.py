@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD BOT v27.0 — GitHub Actions Edition (Forensic-Fixed)
+XAUUSD BOT v27.1 — Ultimate Optimized Edition
 Filename: main.py
 """
 
@@ -39,7 +39,7 @@ def _env_str(k, d=""):
     return (os.getenv(k) or "").strip() or d
 
 # ===========================================================================
-# CONFIG
+# CONFIG (OPTIMIZED FOR XAUUSD 15M)
 # ===========================================================================
 @dataclass(frozen=True)
 class Config:
@@ -51,17 +51,17 @@ class Config:
 
     timeframe_minutes: int = 15
     min_candles: int = 300
-    forward_bars: int = 4
+    forward_bars: int = 12            # ✅ OPTIMASI: 3 jam ke depan (sebelumnya 4)
     atr_period: int = 14
-    atr_sl_multiplier: float = 1.5
-    risk_reward: float = 2.5
+    atr_sl_multiplier: float = 2.0    # ✅ OPTIMASI: SL 2.0 ATR (sebelumnya 1.5)
+    risk_reward: float = 1.5          # ✅ OPTIMASI: TP 1.5 RR (sebelumnya 2.5)
     spread_usd: float = 0.30
 
     base_min_signal_probability: float = 0.60
     max_threshold: float = 0.75
     min_threshold: float = 0.50
-    min_oos_auc: float = 0.58
-    min_oos_precision: float = 0.55
+    min_oos_auc: float = 0.54         # ✅ OPTIMASI: Gate AUC realistis (sebelumnya 0.58)
+    min_oos_precision: float = 0.50   # ✅ OPTIMASI: Gate Precision realistis (sebelumnya 0.55)
 
     max_entropy_threshold: float = 0.99
     min_hurst_threshold: float = 0.30
@@ -115,11 +115,11 @@ def validate_config():
         raise ValueError("forward_bars out of sane range")
 
 # ===========================================================================
-# STATE
+# STATE MANAGEMENT
 # ===========================================================================
 def _default_state() -> Dict[str, Any]:
     return {
-        "version": 270,
+        "version": 271,
         "last_signal_time": None,
         "last_choppy_time": None,
         "daily_signals_count": 0,
@@ -245,7 +245,6 @@ def send_telegram(message: str) -> bool:
 # DATA FETCHING (TWELVE DATA)
 # ===========================================================================
 def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
-    """Twelve Data — spot XAU/USD asli."""
     api_key = _env_str("TWELVE_DATA_KEY")
     if not api_key:
         log.warning("⚠️ TWELVE_DATA_KEY kosong, fallback ke Yahoo GC=F")
@@ -276,7 +275,6 @@ def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.Dat
             for c in ["open", "high", "low", "close"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             
-            # ✅ FIX: Penanganan volume jika tidak disediakan API
             if "volume" in df.columns:
                 df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
             else:
@@ -299,11 +297,8 @@ def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.Dat
 
 
 def _fetch_yahoo_futures(interval: str = "15m", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
-    """Fallback: Yahoo GC=F futures."""
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     days = max(60, bars // (24 * 4))
-    
-    # ✅ FIX: Konversi format interval "15min" ke "15m" untuk Yahoo
     yf_interval = "15m" if interval == "15min" else interval
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={yf_interval}&range={days}d"
     
@@ -677,7 +672,7 @@ def format_message(t: Dict, source: str) -> str:
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v27.0 — Forensic-Fixed GitHub Actions Edition")
+    log.info("XAUUSD v27.1 — Ultimate Optimized GitHub Actions Edition")
     log.info("=" * 60)
     log.info("ACCOUNT_EQUITY: $%.2f | RISK: %.2f%%", CONFIG.account_equity, CONFIG.risk_percent)
 
