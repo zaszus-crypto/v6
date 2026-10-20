@@ -1,14 +1,10 @@
 name: XAUUSD Bot
 
-# Jalankan tiap 15 menit (cron GitHub = UTC).
-# Note: cron GH Actions bisa delay 1-5 menit. Kalau butuh presisi,
-# pertimbangkan VPS. Untuk 15m TF, delay ini masih acceptable.
 on:
   schedule:
     - cron: '0,15,30,45 * * * *'
-  workflow_dispatch:      # tombol "Run workflow" manual
+  workflow_dispatch:
 
-# Cegah overlap kalau run sebelumnya belum selesai
 concurrency:
   group: xauusd-bot
   cancel-in-progress: false
@@ -43,10 +39,11 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           GH_GIST_TOKEN:    ${{ secrets.GH_GIST_TOKEN }}
           GH_GIST_ID:       ${{ secrets.GH_GIST_ID }}
+          TWELVE_DATA_KEY:  ${{ secrets.TWELVE_DATA_KEY }}
           ACCOUNT_EQUITY:   ${{ secrets.ACCOUNT_EQUITY }}
           RISK_PERCENT:     ${{ secrets.RISK_PERCENT }}
           KILL_SWITCH:      ${{ secrets.KILL_SWITCH }}
-        run: python bot.py
+        run: python main.py
 
       - name: Upload run log (opsional, untuk debug)
         if: always()
