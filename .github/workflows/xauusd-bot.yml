@@ -1,4 +1,4 @@
-name: XAUUSD Bot v28
+name: XAUUSD Bot v28.1
 
 on:
   schedule:
@@ -24,3 +24,4 @@ jobs:
           TWELVE_DATA_KEY:   ${{ secrets.TWELVE_DATA_KEY }}
           ACCOUNT_EQUITY:    ${{ secrets.ACCOUNT_EQUITY }}
           BACKTEST_MODE:     "false"
+          DIAGNOSTIC_MODE:   "false"
