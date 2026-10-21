@@ -315,6 +315,11 @@ def _fetch_oanda(interval: str, bars: int) -> Optional[pd.DataFrame]:
 
 # ORCHESTRATOR
 def fetch_xauusd_data(state: Dict[str, Any], interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
+    # ✅ TAMBAHKAN BARIS INI: Ambil harga eksternal untuk validasi
+    ext_spot = _fetch_external_spot()
+    if ext_spot:
+        log.info("🔎 External spot: %.2f USD (Gold-API)", ext_spot)
+
     providers = [
         ("TWELVE_DATA_SPOT", lambda: _fetch_twelvedata_multi(interval, bars)),
         ("DERIV",            lambda: _fetch_deriv(interval, bars)),
@@ -325,6 +330,10 @@ def fetch_xauusd_data(state: Dict[str, Any], interval: str = "15min", bars: int 
         try:
             df = _validate_ohlc(fn(), name)
             if df is not None:
+                # ✅ TAMBAHKAN BARIS INI: Validasi harga sebelum digunakan
+                if not _price_matches(df, ext_spot, name):
+                    continue # Tolak provider ini jika harganya aneh
+                
                 state["last_spot_price"] = float(df["close"].iloc[-1])
                 log.info("✅ Data: %s | %d bars | last=%.2f", name, len(df), float(df["close"].iloc[-1]))
                 return df, name
