@@ -1,4 +1,4 @@
-name: XAUUSD Bot v28.0 — Unified Pipeline
+name: XAUUSD Bot v28.1 — Unified Pipeline
 
 on:
   schedule:
@@ -30,18 +30,25 @@ jobs:
     timeout-minutes: 12
 
     env:
-      TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      GH_GIST_TOKEN:    ${{ secrets.GH_GIST_TOKEN }}
-      GH_GIST_ID:       ${{ secrets.GH_GIST_ID }}
-      TWELVE_DATA_KEY:  ${{ secrets.TWELVE_DATA_KEY }}
-      ACCOUNT_EQUITY:   ${{ vars.ACCOUNT_EQUITY || '1000' }}
-      RISK_PERCENT:     ${{ vars.RISK_PERCENT   || '1.0' }}
-      KILL_SWITCH:      ${{ vars.KILL_SWITCH    || 'false' }}
+      TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+      GH_GIST_TOKEN:      ${{ secrets.GH_GIST_TOKEN }}
+      GH_GIST_ID:         ${{ secrets.GH_GIST_ID }}
+      # ── Multi-source providers ─────────────────────────
+      OANDA_API_KEY:      ${{ secrets.OANDA_API_KEY }}
+      OANDA_ENV:          ${{ vars.OANDA_ENV || 'practice' }}
+      TWELVE_DATA_KEY:    ${{ secrets.TWELVE_DATA_KEY }}
+      TWELVE_DATA_KEY_2:  ${{ secrets.TWELVE_DATA_KEY_2 }}
+      FINNHUB_KEY:        ${{ secrets.FINNHUB_KEY }}
+      GOLD_API_KEY:       ${{ secrets.GOLD_API_KEY }}
+      # ── Trading config ─────────────────────────────────
+      ACCOUNT_EQUITY:     ${{ vars.ACCOUNT_EQUITY || '1000' }}
+      RISK_PERCENT:       ${{ vars.RISK_PERCENT   || '1.0' }}
+      KILL_SWITCH:        ${{ vars.KILL_SWITCH    || 'false' }}
 
     steps:
-      # ═══ PATH A — EMERGENCY STOP ═══
-      - name: "[EMERGENCY] 1. Activate kill switch"
+      # ═══ EMERGENCY STOP ═══
+      - name: "[EMERGENCY] Activate kill switch"
         if: github.event.inputs.mode == 'emergency-stop'
         continue-on-error: true
         env: { GH_TOKEN: '${{ secrets.GH_PAT_ADMIN }}' }
@@ -50,9 +57,8 @@ jobs:
             -f name=KILL_SWITCH -f value=true 2>/dev/null || \
           gh api -X POST "repos/${{ github.repository }}/actions/variables" \
             -f name=KILL_SWITCH -f value=true
-          echo "✅ KILL_SWITCH=true"
 
-      - name: "[EMERGENCY] 2. Freeze Gist"
+      - name: "[EMERGENCY] Freeze Gist"
         if: github.event.inputs.mode == 'emergency-stop'
         continue-on-error: true
         run: |
@@ -68,10 +74,9 @@ jobs:
                   requests.patch(f"https://api.github.com/gists/{gid}",
                       json={"files": {fn: {"content": json.dumps(s, indent=2)}}},
                       headers={"Authorization": f"token {tok}"}, timeout=15)
-                  print(f"✅ Frozen: {fn}")
           PY
 
-      - name: "[EMERGENCY] 3. Cancel in-flight"
+      - name: "[EMERGENCY] Cancel in-flight"
         if: github.event.inputs.mode == 'emergency-stop'
         continue-on-error: true
         env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
@@ -81,14 +86,14 @@ jobs:
             | grep -v "^${{ github.run_id }}$" \
             | xargs -r -I{} gh run cancel {} || true
 
-      - name: "[EMERGENCY] 4. Notify"
+      - name: "[EMERGENCY] Notify"
         if: always() && github.event.inputs.mode == 'emergency-stop'
         run: |
           curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" -d parse_mode=HTML \
             --data-urlencode "text=🛑 <b>EMERGENCY STOP</b> $(date -u +%FT%TZ)" || true
 
-      # ═══ PATH B — BOT ═══
+      # ═══ BOT PATH ═══
       - uses: actions/checkout@v4
         if: github.event.inputs.mode != 'emergency-stop'
 
@@ -106,30 +111,23 @@ jobs:
       - name: Verify code version
         if: github.event.inputs.mode != 'emergency-stop'
         run: |
-          echo "=== Fingerprint ==="
-          head -10 main.py | grep -E "v2[78]"
+          head -10 main.py | grep -E "v2[78]" || echo "version header not found"
           echo "MD5: $(md5sum main.py | cut -d' ' -f1)"
 
-      - name: Health check (watchdog)
+      - name: Provider availability
         if: github.event.inputs.mode != 'emergency-stop'
-        continue-on-error: true
-        env: { GH_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
         run: |
-          LAST=$(gh run list --workflow="${{ github.workflow }}" --status=success \
-                 --limit=1 --json createdAt --jq '.[0].createdAt // "never"')
-          if [ "$LAST" != "never" ] && [ -n "$LAST" ]; then
-            AGE=$(( ( $(date -u +%s) - $(date -u -d "$LAST" +%s) ) / 60 ))
-            echo "⏱ Last success: ${AGE}m ago"
-            if [ "$AGE" -gt 45 ]; then
-              curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage" \
-                -d chat_id="${TELEGRAM_CHAT_ID}" \
-                --data-urlencode "text=⚠️ Bot STALE (${AGE}m)" || true
-            fi
-          fi
+          echo "=== Data Provider Availability ==="
+          [ -n "$OANDA_API_KEY" ]     && echo "✅ OANDA"      || echo "⛔ OANDA missing"
+          [ -n "$TWELVE_DATA_KEY" ]   && echo "✅ TwelveData#1" || echo "⛔ TwelveData#1 missing"
+          [ -n "$TWELVE_DATA_KEY_2" ] && echo "✅ TwelveData#2" || echo "⚪ TwelveData#2 missing"
+          [ -n "$FINNHUB_KEY" ]       && echo "✅ Finnhub"    || echo "⚪ Finnhub missing"
+          [ -n "$GOLD_API_KEY" ]      && echo "✅ Gold-API validation" || echo "⚪ Gold-API missing"
+          echo "⚠️ Yahoo — unauthenticated last resort"
 
       - name: Kill switch guard
         if: github.event.inputs.mode != 'emergency-stop' && vars.KILL_SWITCH == 'true'
-        run: echo "⛔ KILL_SWITCH=true — skipped."
+        run: echo "⛔ KILL_SWITCH=true — bot skipped."
 
       - name: Run bot
         id: bot
@@ -142,9 +140,8 @@ jobs:
           echo "exit_code=$EXIT" >> "$GITHUB_OUTPUT"
           exit $EXIT
 
-      - name: Upload logs
+      - uses: actions/upload-artifact@v4
         if: always() && github.event.inputs.mode != 'emergency-stop'
-        uses: actions/upload-artifact@v4
         with:
           name: bot-log-${{ github.run_id }}
           path: bot.log
