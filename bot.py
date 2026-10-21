@@ -1,29 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD BOT v30.0 — INSTITUTIONAL HARDENED EDITION
-==================================================
-Audit remediation for XAUUSD v29.0 (Forensic Audit, SR 11-7 / López de Prado).
+XAUUSD BOT v30.1 — INSTITUTIONAL HARDENED + TIMEOUT-SAFE EDITION
+=================================================================
+Audit remediation (v30.0) + provider timeout fixes (v30.1).
 
-DEPENDENCIES (requirements.txt):
-    numpy>=1.24
-    pandas>=2.0
-    requests>=2.31
-    yfinance>=0.2.40
-    scikit-learn>=1.3
-    deriv-api>=0.0.53   # optional; bot skips Deriv if import fails
-
-ENVIRONMENT VARIABLES:
-    TELEGRAM_TOKEN, TELEGRAM_CHAT_ID
-    GH_GIST_TOKEN, GH_GIST_ID
-    TWELVE_DATA_KEY, TWELVE_DATA_KEY_2
-    OANDA_API_KEY, OANDA_ENV (practice|live)
-    GOLD_API_KEY
-    ACCOUNT_EQUITY (default 1000.0), RISK_PERCENT (default 1.0)
-    KILL_SWITCH (env bool) or KILL_SWITCH_FILE (path, default ~/.xauusd_kill_switch)
-    BACKTEST_MODE (true|false)
-
-AUDIT FIX MAP:
+FIX MAP:
     F-001 Model cache validation semantics
     F-002 Gist revision-checked write
     H-001 Purged walk-forward + embargo
@@ -36,11 +18,10 @@ AUDIT FIX MAP:
     M-005 Peak-to-trough weekly drawdown enforcement
     M-006 Signal idempotency (pending_send state)
     L-001 Hurst numerical threshold (tau > 1e-12)
-
-KNOWN RESIDUAL RISKS (see audit §6):
-    - Deflated Sharpe / multiple-testing correction not yet applied (trial_count recorded)
-    - Gist is not a database; migrate to Redis/Postgres before scale-up
-    - Intrabar path assumption remains OHLC-level, not tick-level
+    T-001 Deriv ticks_history hard timeout (asyncio.wait_for 15s)
+    T-002 Per-provider ThreadPool timeout (45s) + global deadline (90s)
+    T-003 YFinance download ThreadPool timeout (25s)
+    T-004 Verbose per-provider logging (no more silent failures)
 """
 
 from __future__ import annotations
@@ -52,6 +33,7 @@ import time as py_time
 import hashlib
 import pickle
 import asyncio
+import concurrent.futures
 import logging
 import traceback
 import tempfile
@@ -60,7 +42,6 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List, Iterator
 
-# Third-party imports with graceful degradation
 try:
     import numpy as np
     import pandas as pd
@@ -84,18 +65,8 @@ except ImportError:
 # ===========================================================================
 def _env_float(k: str, d: float) -> float:
     v = (os.getenv(k) or "").strip()
-    try:
-        return float(v) if v else d
-    except ValueError:
-        return d
-
-
-def _env_int(k: str, d: int) -> int:
-    v = (os.getenv(k) or "").strip()
-    try:
-        return int(v) if v else d
-    except ValueError:
-        return d
+    try: return float(v) if v else d
+    except ValueError: return d
 
 
 def _env_bool(k: str, d: bool = False) -> bool:
@@ -149,7 +120,7 @@ class Config:
     max_weekly_drawdown_pct: float = 8.0
     max_consecutive_losses: int = 4
     extreme_atr_percentile: float = 0.995
-    stale_data_max_minutes: int = 60  # M-004
+    stale_data_max_minutes: int = 60
 
     account_equity: float = _env_float("ACCOUNT_EQUITY", 1000.0)
     risk_percent: float = _env_float("RISK_PERCENT", 1.0)
@@ -175,6 +146,12 @@ class Config:
 
     audit_log_path: str = str(Path.home() / ".xauusd_audit.jsonl")
 
+    # T-002: provider timeouts
+    provider_timeout_sec: int = 45
+    fetch_deadline_sec: int = 90
+    deriv_timeout_sec: int = 15
+    yfinance_timeout_sec: int = 25
+
 
 CONFIG = Config()
 
@@ -191,7 +168,7 @@ FEATURES = [
 
 
 # ===========================================================================
-# STRUCTURED JSON LOGGING (audit trail)
+# LOGGING (structured JSON)
 # ===========================================================================
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -233,11 +210,9 @@ def now_utc() -> datetime:
 
 
 # ===========================================================================
-# FILE LOCK (cross-platform)
+# FILE LOCK
 # ===========================================================================
 class FileLock:
-    """Portable file lock with stale detection. F-002: cross-process safety."""
-
     def __init__(self, path: str, timeout: int = 300):
         self.path = path
         self.timeout = timeout
@@ -252,8 +227,7 @@ class FileLock:
                 return self
             except FileExistsError:
                 try:
-                    mtime = os.path.getmtime(self.path)
-                    if py_time.time() - mtime > self.timeout * 2:
+                    if py_time.time() - os.path.getmtime(self.path) > self.timeout * 2:
                         os.remove(self.path)
                         continue
                 except OSError:
@@ -277,14 +251,14 @@ class StateConcurrencyError(RuntimeError):
 
 def _default_state() -> Dict[str, Any]:
     return {
-        "version": 300,
+        "version": 301,
         "_revision": 0,
         "last_signal_time": None,
         "daily_signals_count": 0,
         "daily_pnl_usd": 0.0,
         "last_reset_date": now_utc().strftime("%Y-%m-%d"),
         "active_signals": [],
-        "pending_send": [],  # M-006
+        "pending_send": [],
         "performance_history": {"wins": 0, "losses": 0, "ambiguous": 0},
         "adaptive_threshold": CONFIG.base_min_signal_probability,
         "recent_outcomes": [],
@@ -296,7 +270,7 @@ def _default_state() -> Dict[str, Any]:
         "open_signal_ids": [],
         "last_spot_price": 0.0,
         "last_futures_basis": 0.0,
-        "trial_count": 0,  # H-003
+        "trial_count": 0,
         "last_data_datetime": None,
     }
 
@@ -322,7 +296,10 @@ def _fetch_gist_state() -> Optional[Dict[str, Any]]:
                 for fn, fc in r.json().get("files", {}).items():
                     if fn.endswith("bot_state.json"):
                         return _merge_defaults(json.loads(fc["content"]))
-        except Exception:
+            else:
+                log.warning(f"Gist load HTTP {r.status_code}")
+        except Exception as e:
+            log.warning(f"Gist load failed: {e}")
             py_time.sleep(2)
     return None
 
@@ -357,7 +334,6 @@ def _atomic_write_json(path: str, payload: Dict[str, Any]) -> None:
 
 
 def _save_gist_revision_checked(state: Dict[str, Any]) -> bool:
-    """F-002: optimistic concurrency — refuse overwrite if remote is newer."""
     if not (CONFIG.gist_token and CONFIG.gist_id):
         return True
     remote = _fetch_gist_state()
@@ -380,10 +356,12 @@ def _save_gist_revision_checked(state: Dict[str, Any]) -> bool:
                 return True
             if r.status_code == 412:
                 raise StateConcurrencyError("Gist 412 Precondition Failed.")
+            log.warning(f"Gist save HTTP {r.status_code}")
             py_time.sleep(2)
         except StateConcurrencyError:
             raise
-        except Exception:
+        except Exception as e:
+            log.warning(f"Gist save failed: {e}")
             py_time.sleep(2)
     return False
 
@@ -429,8 +407,10 @@ def send_telegram(message: str, signal_id: Optional[str] = None) -> bool:
                     retry_after = 5
                 py_time.sleep(retry_after + 1)
                 continue
+            log.warning(f"Telegram HTTP {r.status_code}: {r.text[:200]}")
             py_time.sleep(2 + attempt * 2)
-        except requests.RequestException:
+        except requests.RequestException as e:
+            log.warning(f"Telegram send error: {e}")
             py_time.sleep(2 + attempt * 2)
     return False
 
@@ -463,9 +443,12 @@ def _fetch_external_spot() -> Optional[float]:
             timeout=10,
         )
         if r.status_code == 200:
-            return float(r.json().get("price", 0)) or None
-    except Exception:
-        pass
+            price = float(r.json().get("price", 0))
+            log.info(f"Gold-API spot: {price}")
+            return price or None
+        log.warning(f"Gold-API HTTP {r.status_code}")
+    except Exception as e:
+        log.warning(f"Gold-API failed: {e}")
     return None
 
 
@@ -482,13 +465,19 @@ def _price_matches(df: pd.DataFrame, ext_spot: Optional[float], name: str) -> bo
     return True
 
 
+# --- TwelveData (T-004: verbose logging) -----------------------------------
 def _fetch_twelvedata_multi(interval: str, bars: int) -> Optional[pd.DataFrame]:
-    for key in (CONFIG.twelvedata_key, CONFIG.twelvedata_key_2):
-        if not key:
-            continue
+    keys = [k for k in (CONFIG.twelvedata_key, CONFIG.twelvedata_key_2) if k]
+    if not keys:
+        log.warning("TwelveData: no API keys configured")
+        return None
+    for i, key in enumerate(keys, 1):
+        log.info(f"TwelveData: trying key #{i} (...{key[-4:]})")
         df = _fetch_twelvedata_single(key, interval, bars)
         if df is not None:
+            log.info(f"TwelveData OK: {len(df)} bars via key #{i}")
             return df
+        log.warning(f"TwelveData key #{i} failed")
     return None
 
 
@@ -505,47 +494,62 @@ def _fetch_twelvedata_single(api_key: str, interval: str, bars: int) -> Optional
         "timezone": "UTC",
     }
     try:
-        r = requests.get(url, params=params, timeout=20)
+        r = requests.get(url, params=params, timeout=15)
         if r.status_code != 200:
+            log.warning(f"TwelveData HTTP {r.status_code}: {r.text[:200]}")
             return None
-        values = r.json().get("values", [])
-        if not values:
+        j = r.json()
+        if "values" not in j:
+            log.warning(f"TwelveData no values: {json.dumps(j)[:300]}")
             return None
-        df = pd.DataFrame(values)
+        df = pd.DataFrame(j["values"])
         df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
         for c in ("open", "high", "low", "close"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0.0)
         return df.sort_values("datetime").reset_index(drop=True)[REQUIRED_COLS]
-    except Exception:
+    except requests.Timeout:
+        log.warning("TwelveData TIMEOUT 15s")
+        return None
+    except Exception as e:
+        log.warning(f"TwelveData error: {e}")
         return None
 
 
+# --- Deriv (T-001: hard timeout) -------------------------------------------
 async def _fetch_deriv_async(interval: str, bars: int) -> Optional[pd.DataFrame]:
     if not _HAS_DERIV:
+        log.info("Deriv: library not installed, skipping")
         return None
     gran_map = {"15min": 900, "1h": 3600, "5min": 300, "1min": 60}
     api = DerivAPI(app_id=1089)
     try:
-        response = await api.ticks_history({
-            "ticks_history": "frxXAUUSD",
-            "style": "candles",
-            "granularity": gran_map.get(interval, 900),
-            "count": min(bars, 5000),
-            "end": "latest",
-        })
+        response = await asyncio.wait_for(
+            api.ticks_history({
+                "ticks_history": "frxXAUUSD",
+                "style": "candles",
+                "granularity": gran_map.get(interval, 900),
+                "count": min(bars, 5000),
+                "end": "latest",
+            }),
+            timeout=CONFIG.deriv_timeout_sec,
+        )
         if "candles" not in response:
+            log.warning("Deriv: response without candles")
             return None
         df = pd.DataFrame(response["candles"])
         df["datetime"] = pd.to_datetime(df["epoch"], unit="s", utc=True)
         df["volume"] = 0.0
         return df[REQUIRED_COLS].sort_values("datetime").reset_index(drop=True)
+    except asyncio.TimeoutError:
+        log.warning(f"Deriv ticks_history TIMEOUT {CONFIG.deriv_timeout_sec}s")
+        return None
     except Exception as e:
         log.warning(f"Deriv async failed: {e}")
         return None
     finally:
         try:
-            await api.disconnect()
+            await asyncio.wait_for(api.disconnect(), timeout=5.0)
         except Exception:
             pass
 
@@ -553,10 +557,12 @@ async def _fetch_deriv_async(interval: str, bars: int) -> Optional[pd.DataFrame]
 def _fetch_deriv(interval: str, bars: int) -> Optional[pd.DataFrame]:
     try:
         return asyncio.run(_fetch_deriv_async(interval, bars))
-    except Exception:
+    except Exception as e:
+        log.warning(f"Deriv top-level failed: {e}")
         return None
 
 
+# --- YFinance offset (T-003: ThreadPool timeout) ---------------------------
 def _fetch_yfinance_offset(interval: str, bars: int, state: Dict[str, Any]) -> Optional[pd.DataFrame]:
     try:
         spot_anchor = state.get("last_spot_price", 0.0)
@@ -564,15 +570,33 @@ def _fetch_yfinance_offset(interval: str, bars: int, state: Dict[str, Any]) -> O
             df_spot = _fetch_twelvedata_single(CONFIG.twelvedata_key, interval, 10)
             if df_spot is not None:
                 spot_anchor = float(df_spot["close"].iloc[-1])
+
         period = "5d" if "min" in interval else "1mo"
-        df_fut = yf.download("GC=F", period=period, interval=interval, progress=False)
-        if df_fut.empty:
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(
+                yf.download, "GC=F", period=period,
+                interval=interval, progress=False, threads=False,
+            )
+            try:
+                df_fut = fut.result(timeout=CONFIG.yfinance_timeout_sec)
+            except concurrent.futures.TimeoutError:
+                log.warning(f"YFinance download TIMEOUT {CONFIG.yfinance_timeout_sec}s")
+                return None
+
+        if df_fut is None or df_fut.empty:
+            log.warning("YFinance: empty dataframe")
             return None
+
         last_fut = float(df_fut["Close"].iloc[-1])
         basis = state.get("last_futures_basis", 0.0)
         if spot_anchor > 0:
             basis = last_fut - spot_anchor
             state["last_futures_basis"] = basis
+            log.info(f"YFinance basis applied: {basis:.2f} (fut={last_fut:.2f}, spot={spot_anchor:.2f})")
+        else:
+            log.warning("YFinance: no spot anchor, using historical basis")
+
         df = pd.DataFrame({
             "datetime": df_fut.index,
             "open": df_fut["Open"] - basis,
@@ -588,8 +612,10 @@ def _fetch_yfinance_offset(interval: str, bars: int, state: Dict[str, Any]) -> O
         return None
 
 
+# --- OANDA -----------------------------------------------------------------
 def _fetch_oanda(interval: str, bars: int) -> Optional[pd.DataFrame]:
     if not CONFIG.oanda_api_key:
+        log.info("OANDA: no API key configured, skipping")
         return None
     gran = {"15min": "M15", "1h": "H1", "5min": "M5"}.get(interval, "M15")
     host = "https://api-fxpractice.oanda.com" if CONFIG.oanda_env == "practice" \
@@ -602,6 +628,7 @@ def _fetch_oanda(interval: str, bars: int) -> Optional[pd.DataFrame]:
             timeout=20,
         )
         if r.status_code != 200:
+            log.warning(f"OANDA HTTP {r.status_code}: {r.text[:200]}")
             return None
         rows = []
         for c in r.json().get("candles", []):
@@ -617,35 +644,59 @@ def _fetch_oanda(interval: str, bars: int) -> Optional[pd.DataFrame]:
                 "volume": int(c.get("volume", 0)),
             })
         return pd.DataFrame(rows) if rows else None
-    except Exception:
+    except Exception as e:
+        log.warning(f"OANDA failed: {e}")
         return None
 
 
+# --- Orchestrator (T-002: per-provider timeout + global deadline) ---------
 def fetch_xauusd_data(state: Dict[str, Any], interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
+    started = py_time.time()
+    log.info("Fetching external spot (Gold-API)...")
     ext_spot = _fetch_external_spot()
+
     providers = [
         ("TWELVE_DATA_SPOT", lambda: _fetch_twelvedata_multi(interval, bars)),
-        ("DERIV", lambda: _fetch_deriv(interval, bars)),
-        ("YFINANCE_OFFSET", lambda: _fetch_yfinance_offset(interval, bars, state)),
-        ("OANDA_V20", lambda: _fetch_oanda(interval, bars)),
+        ("DERIV",            lambda: _fetch_deriv(interval, bars)),
+        ("YFINANCE_OFFSET",  lambda: _fetch_yfinance_offset(interval, bars, state)),
+        ("OANDA_V20",        lambda: _fetch_oanda(interval, bars)),
     ]
+
     for name, fn in providers:
+        elapsed = py_time.time() - started
+        if elapsed > CONFIG.fetch_deadline_sec:
+            raise RuntimeError(f"Global data deadline exceeded ({elapsed:.0f}s) at {name}")
+        log.info(f"Provider attempt: {name} (elapsed={elapsed:.1f}s)")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(fn)
+            try:
+                raw = fut.result(timeout=CONFIG.provider_timeout_sec)
+            except concurrent.futures.TimeoutError:
+                log.warning(f"Provider {name} HARD TIMEOUT {CONFIG.provider_timeout_sec}s — skipping")
+                continue
+            except Exception as e:
+                log.warning(f"Provider {name} exception: {e}")
+                continue
+
         try:
-            df = _validate_ohlc(fn(), name)
+            df = _validate_ohlc(raw, name)
             if df is None:
+                log.info(f"Provider {name}: insufficient or invalid bars")
                 continue
             if not _price_matches(df, ext_spot, name):
+                log.info(f"Provider {name}: price mismatch rejected")
                 continue
             state["last_spot_price"] = float(df["close"].iloc[-1])
             log.info(f"Data OK: {name} | {len(df)} bars | last={state['last_spot_price']:.2f}")
             return df, name
         except Exception as e:
-            log.warning(f"Provider {name} failed: {e}")
-    raise RuntimeError("All data sources failed")
+            log.warning(f"Provider {name} post-processing error: {e}")
+
+    raise RuntimeError(f"All providers failed (elapsed={py_time.time()-started:.1f}s)")
 
 
 def sanitize_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
-    """Drop unclosed last bar and enforce staleness check (M-004)."""
     if df is None or len(df) < 2:
         return None
     df = df.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
@@ -655,7 +706,7 @@ def sanitize_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
         if len(df) > 0:
             age_min = (now_utc() - df["datetime"].iloc[-1]).total_seconds() / 60
     if age_min > CONFIG.stale_data_max_minutes:
-        log.warning(f"Stale data: last bar is {age_min:.1f} min old > {CONFIG.stale_data_max_minutes}")
+        log.warning(f"Stale data: last bar {age_min:.1f} min old > {CONFIG.stale_data_max_minutes}")
         return None
     return df if len(df) >= CONFIG.min_candles else None
 
@@ -674,7 +725,6 @@ def wilder_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
 
 
 def hurst_exponent(series: np.ndarray, max_lag: int = 20) -> float:
-    """L-001: numerical threshold tau > 1e-12 to reject denoised near-zero."""
     s = series[np.isfinite(series)]
     if len(s) < max_lag * 2:
         return 0.5
@@ -701,7 +751,6 @@ def shannon_entropy(returns: np.ndarray, bins: int = 10) -> float:
 
 
 def rolling_hurst(close: np.ndarray, window: int, stride: int) -> np.ndarray:
-    """M-001: last bar is always computed fresh regardless of stride."""
     n = len(close)
     log_s = np.log(np.maximum(close, 1e-10))
     out = np.full(n, np.nan)
@@ -855,7 +904,6 @@ def _purged_walk_forward_splits(
     n_splits: int = 4,
     embargo_bars: int = 10,
 ) -> Iterator[Tuple[np.ndarray, np.ndarray]]:
-    """H-001: purge by label_end, embargo by feature-window proximity."""
     valid_idx = np.flatnonzero(label_end >= 0)
     if len(valid_idx) < n_splits * 2:
         return
@@ -933,14 +981,14 @@ def purged_embargoed_cv(
 
 
 def _model_fingerprint(df_feat: pd.DataFrame) -> str:
-    """Model versioning for audit trail (PILAR 5)."""
     n = len(df_feat)
     last_ts = df_feat["datetime"].iloc[-1].isoformat() if n else ""
-    return hashlib.sha256(f"{n}|{last_ts}|{CONFIG.forward_bars}|{CONFIG.atr_sl_multiplier}".encode()).hexdigest()[:16]
+    return hashlib.sha256(
+        f"{n}|{last_ts}|{CONFIG.forward_bars}|{CONFIG.atr_sl_multiplier}".encode()
+    ).hexdigest()[:16]
 
 
 def _load_valid_cache(df_feat: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """F-001: cache is valid only if (a) fresh AND (b) trained on current data end."""
     if not os.path.exists(CONFIG.model_cache_path):
         return None
     try:
@@ -961,10 +1009,10 @@ def _load_valid_cache(df_feat: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
 
 def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
-    """F-001: cache hit only bypasses final fit, never CV validation."""
     if not force:
         cached = _load_valid_cache(df_feat)
         if cached is not None:
+            log.info(f"Cache hit: model v{cached.get('model_version')} AUC={cached.get('auc'):.3f}")
             return cached
 
     df_lab, label_end = triple_barrier_labels_with_end(
@@ -980,7 +1028,9 @@ def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
     if len(np.unique(y)) < 2:
         return {"valid": False, "reason": "single_class"}
 
+    log.info(f"Training: {len(X)} samples, running purged CV...")
     wf = purged_embargoed_cv(X, y, le)
+    log.info(f"CV result: AUC={wf['auc_mean']:.3f} PREC={wf['prec_mean']:.3f} folds={wf['n_folds']}")
     if not wf["valid"] or wf["auc_mean"] < CONFIG.min_oos_auc or wf["prec_mean"] < CONFIG.min_oos_precision:
         return {
             "valid": False,
@@ -992,6 +1042,7 @@ def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
     model = build_model()
     model.fit(X, y, sample_weight=weights)
 
+    fingerprint = _model_fingerprint(df_feat)
     out = {
         "valid": True,
         "model": model,
@@ -999,8 +1050,8 @@ def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
         "prec": wf["prec_mean"],
         "n_folds": wf["n_folds"],
         "n_train_samples": int(n),
-        "data_fingerprint": _model_fingerprint(df_feat),
-        "model_version": _model_fingerprint(df_feat),
+        "data_fingerprint": fingerprint,
+        "model_version": fingerprint,
         "trained_at": now_utc().isoformat(),
     }
     if not CONFIG.backtest_mode:
@@ -1014,7 +1065,7 @@ def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
 
 
 # ===========================================================================
-# SIGNAL RESOLUTION (H-002, M-002, M-003)
+# SIGNAL RESOLUTION
 # ===========================================================================
 def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
     if not state.get("active_signals"):
@@ -1043,7 +1094,6 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
                 hit_tp = float(bar["low"]) <= sig["tp"]
 
             if hit_sl and hit_tp:
-                # H-002: conservative stop-first on ambiguous bars
                 outcome, exit_price = "loss", sig["sl"]
                 ambiguous = True
                 break
@@ -1057,7 +1107,6 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
         if outcome is None:
             if now >= expires and len(sig_df) > 0:
                 last_close = float(sig_df["close"].iloc[-1])
-                # M-002: full spread + slippage on timeout exit
                 if sig["type"] == "BUY":
                     exit_price = last_close - CONFIG.spread_usd / 2 - CONFIG.slippage_usd
                     pnl = (exit_price - sig["entry"]) * sig["lot"] * CONFIG.contract_size
@@ -1068,7 +1117,6 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             else:
                 still_active.append(sig)
         else:
-            # M-003: actual PnL from exit_price, not planned risk
             cost = (CONFIG.spread_usd + CONFIG.slippage_usd) * sig["lot"] * CONFIG.contract_size
             if sig["type"] == "BUY":
                 raw_pnl = (exit_price - sig["entry"]) * sig["lot"] * CONFIG.contract_size
@@ -1183,7 +1231,7 @@ def format_message(t: Dict[str, Any], source: str) -> str:
 
 
 # ===========================================================================
-# CIRCUIT BREAKERS (M-004, M-005)
+# CIRCUIT BREAKERS
 # ===========================================================================
 def _kill_switch_active() -> bool:
     if _env_bool(CONFIG.kill_switch_env, False):
@@ -1207,7 +1255,6 @@ def circuit_breakers_ok(state: Dict[str, Any], df_feat: pd.DataFrame) -> Tuple[b
     if state.get("consecutive_losses", 0) >= CONFIG.max_consecutive_losses:
         return False, "consecutive_losses"
 
-    # M-005: peak-to-trough drawdown
     peak = state.get("peak_equity", CONFIG.account_equity)
     current = CONFIG.account_equity + state["daily_pnl_usd"]
     if peak > 0:
@@ -1215,7 +1262,6 @@ def circuit_breakers_ok(state: Dict[str, Any], df_feat: pd.DataFrame) -> Tuple[b
         if dd_pct >= CONFIG.max_weekly_drawdown_pct:
             return False, f"peak_drawdown_{dd_pct:.1f}%"
 
-    # Extreme volatility guard
     if len(df_feat) > 100:
         q = df_feat["atr"].tail(500).quantile(CONFIG.extreme_atr_percentile)
         if float(df_feat.iloc[-1]["atr"]) >= q:
@@ -1225,16 +1271,18 @@ def circuit_breakers_ok(state: Dict[str, Any], df_feat: pd.DataFrame) -> Tuple[b
 
 
 # ===========================================================================
-# TELEGRAM IDEMPOTENCY (M-006)
+# TELEGRAM IDEMPOTENCY
 # ===========================================================================
 def _flush_pending_sends(state: Dict[str, Any]) -> None:
     if not state.get("pending_send"):
         return
+    log.info(f"Flushing {len(state['pending_send'])} pending sends...")
     remaining = []
     for item in state["pending_send"]:
         try:
             ok = send_telegram(item["message"], signal_id=item["signal_id"])
-        except Exception:
+        except Exception as e:
+            log.warning(f"Pending send exception: {e}")
             ok = False
         if ok:
             state["active_signals"].append(item["trade"])
@@ -1252,9 +1300,10 @@ def _flush_pending_sends(state: Dict[str, Any]) -> None:
 # MAIN
 # ===========================================================================
 def main() -> None:
-    log.info("XAUUSD v30.0 — Institutional Hardened Edition starting")
+    log.info("XAUUSD v30.1 — Institutional Hardened + Timeout-Safe starting")
 
     with FileLock(CONFIG.state_lock_path, CONFIG.state_lock_timeout_sec):
+        log.info("Loading state...")
         state = load_state()
 
         today = now_utc().strftime("%Y-%m-%d")
@@ -1268,14 +1317,19 @@ def main() -> None:
             state["week_start_equity"] = CONFIG.account_equity + state.get("daily_pnl_usd", 0.0)
             state["week_start_date"] = week
 
-        # Retry any pending Telegram sends before new signals
         _flush_pending_sends(state)
 
-        if _kill_switch_active() or now_utc().weekday() >= 5:
-            log.info("Market closed or kill switch active")
+        if _kill_switch_active():
+            log.info("Kill switch active")
             save_state(state)
             return
 
+        if now_utc().weekday() >= 5:
+            log.info("Weekend — market closed")
+            save_state(state)
+            return
+
+        log.info("Fetching market data...")
         try:
             df, source = fetch_xauusd_data(state)
             df = sanitize_df(df)
@@ -1287,8 +1341,10 @@ def main() -> None:
             log.error(f"All providers failed: {e}")
             return
 
+        log.info(f"Data source: {source} | last bar: {df['datetime'].iloc[-1]}")
         state["last_data_source"] = source
         state["last_data_datetime"] = df["datetime"].iloc[-1].isoformat()
+
         resolve_active_signals(state, df)
         save_state(state)
 
@@ -1302,12 +1358,15 @@ def main() -> None:
             try:
                 elapsed = (now_utc() - datetime.fromisoformat(state["last_signal_time"])).total_seconds() / 60
                 if elapsed < CONFIG.cooldown_minutes:
+                    log.info(f"Cooldown: {elapsed:.0f}/{CONFIG.cooldown_minutes} min")
                     return
             except Exception:
                 pass
 
+        log.info("Computing features...")
         df_feat = calculate_features(df)
         if len(df_feat) < CONFIG.min_candles:
+            log.info(f"Insufficient feature rows: {len(df_feat)}")
             return
         last = df_feat.iloc[-1]
 
@@ -1324,9 +1383,9 @@ def main() -> None:
             log.warning(f"Circuit breaker: {cb_reason}")
             return
 
-        # H-003: trial count is incremented every training attempt
         state["trial_count"] = state.get("trial_count", 0) + 1
 
+        log.info("Training / validating model...")
         models = train_model(df_feat)
         if not models.get("valid"):
             log.info(f"Invalid model: {models.get('reason')}")
@@ -1338,6 +1397,7 @@ def main() -> None:
         pred = int(model.predict(X_live)[0])
         proba = model.predict_proba(X_live)[0]
         prob_dict = {int(c): float(proba[i]) for i, c in enumerate(model.classes_)}
+        log.info(f"Prediction: {pred} probs={prob_dict}")
 
         if pred == 0:
             log.info("Neutral prediction")
@@ -1354,10 +1414,10 @@ def main() -> None:
         adx = float(last["adx"])
         rsi = float(last["rsi"])
         if sig_type == "BUY" and (close_price < ema_trend or adx < 20.0 or rsi > 75):
-            log.info("Rule filter rejected BUY")
+            log.info(f"Rule filter rejected BUY (close={close_price:.2f} ema={ema_trend:.2f} adx={adx:.1f} rsi={rsi:.1f})")
             return
         if sig_type == "SELL" and (close_price > ema_trend or adx < 20.0 or rsi < 25):
-            log.info("Rule filter rejected SELL")
+            log.info(f"Rule filter rejected SELL (close={close_price:.2f} ema={ema_trend:.2f} adx={adx:.1f} rsi={rsi:.1f})")
             return
 
         trade = compute_trade(sig_type, df_feat, prob, source)
@@ -1368,7 +1428,6 @@ def main() -> None:
             log.info("Duplicate signal_id")
             return
 
-        # M-006: persist pending_send BEFORE Telegram call
         message = format_message(trade, source)
         state["pending_send"].append({
             "signal_id": trade["signal_id"],
@@ -1378,12 +1437,12 @@ def main() -> None:
         })
         save_state(state)
 
+        log.info(f"Sending Telegram for {trade['signal_id']}...")
         ok = send_telegram(message, signal_id=trade["signal_id"])
         if not ok:
             log.error("Telegram send failed; kept in pending_send for retry")
             return
 
-        # Commit: move from pending to active
         state["pending_send"] = [p for p in state["pending_send"] if p["signal_id"] != trade["signal_id"]]
         state["active_signals"].append(trade)
         state["open_signal_ids"].append(trade["signal_id"])
@@ -1391,7 +1450,7 @@ def main() -> None:
         state["last_signal_time"] = now_utc().isoformat()
         save_state(state)
 
-        log.info(f"{sig_type} sent | Entry={trade['entry']:.2f} Lot={trade['lot']} "
+        log.info(f"{sig_type} SENT | Entry={trade['entry']:.2f} Lot={trade['lot']} "
                  f"Risk=${trade['risk_usd']:.2f} Model={models.get('model_version', 'n/a')}")
 
 
