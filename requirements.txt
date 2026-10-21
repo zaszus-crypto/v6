@@ -1,8 +1,6 @@
-numpy>=1.24.0,<2.0.0
-pandas>=2.0.0,<3.0.0
-scikit-learn>=1.3.0,<2.0.0
-requests>=2.31.0,<3.0.0
 numpy==1.26.4
 pandas==2.2.2
-scikit-learn==1.5.1
+scikit-learn==1.5.2
 requests==2.32.3
+yfinance==0.2.40
+python-deriv-api==0.1.2
