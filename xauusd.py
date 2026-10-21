@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD BOT v28.0 — INSTITUTIONAL HARDENED EDITION
-=================================================
-Fixes: P0-1..P0-5, P1-1..P1-8, P2-1, P2-3, P2-7, P2-10.
-Deployment: single-host (GH Actions / VPS). Local file = authority, Gist = backup.
+XAUUSD BOT v28.1 — INSTITUTIONAL HARDENED EDITION (Multi-Source)
+=================================================================
+Provider chain: OANDA v20 → TwelveData (2 keys) → Finnhub → Yahoo Futures
+Validation: Gold-API spot (non-blocking sanity cross-check)
+Fixes preserved from v28.0: P0-1..P0-5, P1-1..P1-8, P2-1, P2-3, P2-7, P2-10.
+New in v28.1: multi-provider fallback, schema validation, circuit breaker.
 """
 
 import os, sys, json, logging, time as py_time, hashlib, fcntl, pickle
@@ -42,12 +44,23 @@ def _env_str(k, d=""):
 # ===========================================================================
 @dataclass(frozen=True)
 class Config:
+    # ── Notifications & state ──────────────────────────────
     telegram_token: str = _env_str("TELEGRAM_TOKEN")
     telegram_chat_id: str = _env_str("TELEGRAM_CHAT_ID")
     gist_token: str = _env_str("GH_GIST_TOKEN")
     gist_id: str = _env_str("GH_GIST_ID")
     backtest_mode: bool = _env_bool("BACKTEST_MODE", False)
 
+    # ── Data providers ─────────────────────────────────────
+    oanda_api_key: str = _env_str("OANDA_API_KEY")
+    oanda_env: str = _env_str("OANDA_ENV", "practice")
+    twelvedata_key: str = _env_str("TWELVE_DATA_KEY")
+    twelvedata_key_2: str = _env_str("TWELVE_DATA_KEY_2")
+    finnhub_key: str = _env_str("FINNHUB_KEY")
+    goldapi_key: str = _env_str("GOLD_API_KEY")
+    price_deviation_max_pct: float = _env_float("PRICE_DEVIATION_MAX_PCT", 1.0)
+
+    # ── Time-series / model ────────────────────────────────
     timeframe_minutes: int = 15
     min_candles: int = 300
     forward_bars: int = 8
@@ -107,7 +120,7 @@ FEATURES = [
 logging.basicConfig(level=logging.INFO,
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     stream=sys.stderr, force=True)
-log = logging.getLogger("xauusd_v28")
+log = logging.getLogger("xauusd_v281")
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
@@ -133,18 +146,16 @@ class FileLock:
         try:
             fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
             self._fh.close()
-        except Exception:
-            pass
+        except Exception: pass
 
 # ===========================================================================
 # STATE
 # ===========================================================================
 def _default_state() -> Dict[str, Any]:
     return {
-        "version": 280,
+        "version": 281,
         "_revision": 0,
         "last_signal_time": None,
-        "last_choppy_time": None,
         "daily_signals_count": 0,
         "daily_pnl_usd": 0.0,
         "last_reset_date": now_utc().strftime("%Y-%m-%d"),
@@ -159,10 +170,10 @@ def _default_state() -> Dict[str, Any]:
         "open_signal_ids": [],
     }
 
-def _merge_defaults(state: Dict[str, Any]) -> Dict[str, Any]:
+def _merge_defaults(s: Dict[str, Any]) -> Dict[str, Any]:
     for k, v in _default_state().items():
-        if k not in state: state[k] = v
-    return state
+        if k not in s: s[k] = v
+    return s
 
 def load_state() -> Dict[str, Any]:
     if os.path.exists(CONFIG.state_path):
@@ -192,11 +203,9 @@ def load_state() -> Dict[str, Any]:
     return _default_state()
 
 def save_state(state: Dict[str, Any]) -> bool:
-    # BACKTEST_MODE guard — never write state in dry-run
     if CONFIG.backtest_mode:
         log.info("🧪 BACKTEST_MODE — state write skipped")
         return True
-
     state["_revision"] = int(state.get("_revision", 0)) + 1
     try:
         tmp = CONFIG.state_path + ".tmp"
@@ -204,9 +213,7 @@ def save_state(state: Dict[str, Any]) -> bool:
             json.dump(state, f, indent=2)
         os.replace(tmp, CONFIG.state_path)
     except Exception as e:
-        log.error("Local save failed: %s", e)
-        return False
-
+        log.error("Local save failed: %s", e); return False
     if CONFIG.gist_token and CONFIG.gist_id:
         for attempt in range(1, 3):
             try:
@@ -246,43 +253,108 @@ def send_telegram(message: str) -> bool:
     return False
 
 # ===========================================================================
-# DATA FETCHING
+# DATA — Multi-provider with validation
 # ===========================================================================
-def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
-    api_key = _env_str("TWELVE_DATA_KEY")
-    if api_key:
-        try:
-            df = _fetch_twelvedata(api_key, interval, bars)
-            if df is not None and len(df) >= CONFIG.min_candles:
-                return df, "TWELVE_DATA_SPOT"
-        except Exception as e:
-            log.warning("TwelveData failed: %s", e)
-    for attempt in range(1, 4):
-        try:
-            df = _fetch_yahoo_futures(interval, bars)
-            if df is not None and len(df) >= CONFIG.min_candles:
-                return df, "YAHOO_FUTURES"
-        except Exception as e:
-            log.warning("Yahoo attempt %d: %s", attempt, e)
-            py_time.sleep(2 ** attempt)
-    raise RuntimeError("All data sources failed")
+REQUIRED_COLS = ["datetime", "open", "high", "low", "close", "volume"]
 
-def _fetch_twelvedata(api_key: str, interval: str, bars: int) -> Optional[pd.DataFrame]:
+def _validate_ohlc(df: Optional[pd.DataFrame], name: str) -> Optional[pd.DataFrame]:
+    if df is None:
+        return None
+    if len(df) < CONFIG.min_candles:
+        log.warning("Schema %s: only %d bars < %d", name, len(df), CONFIG.min_candles)
+        return None
+    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    if missing:
+        log.warning("Schema %s: missing %s", name, missing)
+        return None
+    if not df["datetime"].is_monotonic_increasing:
+        df = df.sort_values("datetime").reset_index(drop=True)
+    if df[["open","high","low","close"]].isna().any().any():
+        log.warning("Schema %s: NaN in OHLC", name)
+        return None
+    if (df["close"] <= 0).any():
+        log.warning("Schema %s: non-positive close", name)
+        return None
+    return df
+
+# ── Provider 1: OANDA v20 (broker-grade) ────────────────────────────
+def _fetch_oanda(interval: str, bars: int) -> Optional[pd.DataFrame]:
+    if not CONFIG.oanda_api_key:
+        return None
+    gran_map = {"15min": "M15", "1h": "H1", "5min": "M5", "1min": "M1"}
+    gran = gran_map.get(interval, "M15")
+    host = ("https://api-fxpractice.oanda.com" if CONFIG.oanda_env == "practice"
+            else "https://api-fxtrade.oanda.com")
+    url = f"{host}/v3/instruments/XAU_USD/candles"
+    params = {"granularity": gran, "count": min(bars, 5000), "price": "M"}
+    headers = {"Authorization": f"Bearer {CONFIG.oanda_api_key}"}
+    for attempt in range(1, 3):
+        try:
+            r = requests.get(url, params=params, headers=headers, timeout=20)
+            if r.status_code == 401:
+                log.error("OANDA: auth failed (check OANDA_API_KEY)"); return None
+            if r.status_code == 429:
+                py_time.sleep(20); continue
+            if r.status_code != 200:
+                raise RuntimeError(f"HTTP {r.status_code}")
+            candles = r.json().get("candles", [])
+            if not candles:
+                raise RuntimeError("empty candles")
+            rows = []
+            for c in candles:
+                if not c.get("complete", False):
+                    continue  # skip forming bar
+                m = c["mid"]
+                rows.append({
+                    "datetime": pd.to_datetime(c["time"], utc=True),
+                    "open": float(m["o"]), "high": float(m["h"]),
+                    "low": float(m["l"]), "close": float(m["c"]),
+                    "volume": int(c.get("volume", 0)),
+                })
+            if len(rows) < CONFIG.min_candles:
+                raise RuntimeError(f"only {len(rows)} complete candles")
+            return pd.DataFrame(rows)
+        except Exception as e:
+            log.warning("OANDA attempt %d: %s", attempt, e)
+            py_time.sleep(2 ** attempt)
+    return None
+
+# ── Provider 2: TwelveData (2-key rotation) ─────────────────────────
+def _fetch_twelvedata_multi(interval: str, bars: int) -> Optional[pd.DataFrame]:
+    keys = [k for k in [CONFIG.twelvedata_key, CONFIG.twelvedata_key_2] if k]
+    if not keys: return None
+    for i, key in enumerate(keys, 1):
+        df = _fetch_twelvedata_single(key, interval, bars)
+        if df is not None and len(df) >= CONFIG.min_candles:
+            return df
+        if i < len(keys):
+            log.info("TwelveData key #%d failed, trying key #%d", i, i + 1)
+    return None
+
+def _fetch_twelvedata_single(api_key: str, interval: str, bars: int) -> Optional[pd.DataFrame]:
     url = "https://api.twelvedata.com/time_series"
     params = {"symbol": "XAU/USD", "interval": interval, "outputsize": min(bars, 5000),
               "apikey": api_key, "format": "JSON", "timezone": "UTC"}
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
             r = requests.get(url, params=params, timeout=20)
-            if r.status_code == 429: py_time.sleep(30); continue
+            if r.status_code == 429:
+                py_time.sleep(20); continue
             data = r.json()
+            if "code" in data and data.get("code") not in (200, "200"):
+                raise RuntimeError(f"API: {data.get('message', data['code'])}")
             values = data.get("values", [])
-            if not values: raise RuntimeError("Empty values")
+            if not values:
+                raise RuntimeError("empty values")
             df = pd.DataFrame(values)
             df["datetime"] = pd.to_datetime(df["datetime"], utc=True)
             for c in ["open", "high", "low", "close"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            df["volume"] = pd.to_numeric(df.get("volume", 0), errors="coerce").fillna(0.0)
+            # ✅ FIX: missing volume column safe
+            if "volume" in df.columns:
+                df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+            else:
+                df["volume"] = 0.0
             df = df.sort_values("datetime").reset_index(drop=True)
             return df[["datetime","open","high","low","close","volume"]]
         except Exception as e:
@@ -290,31 +362,121 @@ def _fetch_twelvedata(api_key: str, interval: str, bars: int) -> Optional[pd.Dat
             py_time.sleep(2 ** attempt)
     return None
 
+# ── Provider 3: Finnhub ─────────────────────────────────────────────
+def _fetch_finnhub(interval: str, bars: int) -> Optional[pd.DataFrame]:
+    if not CONFIG.finnhub_key: return None
+    res_map = {"15min": "15", "1h": "60", "5min": "5", "1min": "1"}
+    resolution = res_map.get(interval, "15")
+    now = int(now_utc().timestamp())
+    start = now - bars * CONFIG.timeframe_minutes * 60 * 2
+    url = "https://finnhub.io/api/v1/forex/candle"
+    params = {"symbol": "OANDA:XAU_USD", "resolution": resolution,
+              "from": start, "to": now, "token": CONFIG.finnhub_key}
+    for attempt in range(1, 3):
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            if r.status_code == 429:
+                py_time.sleep(60); continue
+            d = r.json()
+            if d.get("s") != "ok":
+                raise RuntimeError(f"status={d.get('s')}")
+            if not d.get("c"):
+                raise RuntimeError("empty c")
+            df = pd.DataFrame({
+                "datetime": pd.to_datetime(d["t"], unit="s", utc=True),
+                "open": d["o"], "high": d["h"], "low": d["l"], "close": d["c"],
+                "volume": d.get("v", [0]*len(d["c"])),
+            })
+            return df.tail(bars).reset_index(drop=True)
+        except Exception as e:
+            log.warning("Finnhub attempt %d: %s", attempt, e)
+            py_time.sleep(2 ** attempt)
+    return None
+
+# ── Provider 4: Yahoo Futures (last resort) ─────────────────────────
 def _fetch_yahoo_futures(interval: str, bars: int) -> Optional[pd.DataFrame]:
     headers = {"User-Agent": "Mozilla/5.0"}
-    yf_interval = "15m" if interval == "15min" else interval
-    url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={yf_interval}&range=60d"
-    r = requests.get(url, headers=headers, timeout=15)
-    if r.status_code != 200: raise RuntimeError(f"Yahoo HTTP {r.status_code}")
-    res = r.json().get("chart", {}).get("result", [])
-    if not res: raise RuntimeError("Yahoo empty result")
-    res = res[0]
-    q = res.get("indicators", {}).get("quote", [{}])[0]
-    df = pd.DataFrame({
-        "datetime": pd.to_datetime(res["timestamp"], unit="s", utc=True),
-        "open": q.get("open"), "high": q.get("high"),
-        "low": q.get("low"), "close": q.get("close"),
-        "volume": q.get("volume", [0]*len(res["timestamp"])),
-    }).dropna()
-    if df.empty: raise RuntimeError("Yahoo empty after dropna")
-    return df.reset_index(drop=True)
+    yf_int = "15m" if interval == "15min" else interval
+    for host in ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]:
+        try:
+            url = f"https://{host}/v8/finance/chart/GC=F?interval={yf_int}&range=60d"
+            r = requests.get(url, headers=headers, timeout=15)
+            if r.status_code != 200: continue
+            res = r.json().get("chart", {}).get("result", [])
+            if not res: continue
+            res = res[0]
+            q = res.get("indicators", {}).get("quote", [{}])[0]
+            df = pd.DataFrame({
+                "datetime": pd.to_datetime(res["timestamp"], unit="s", utc=True),
+                "open": q.get("open"), "high": q.get("high"),
+                "low": q.get("low"), "close": q.get("close"),
+                "volume": q.get("volume", [0]*len(res["timestamp"])),
+            }).dropna()
+            if df.empty: continue
+            return df.tail(bars).reset_index(drop=True)
+        except Exception as e:
+            log.warning("Yahoo %s: %s", host, e)
+    return None
+
+# ── Validation: external spot cross-check ───────────────────────────
+def _fetch_external_spot() -> Optional[float]:
+    if not CONFIG.goldapi_key: return None
+    try:
+        r = requests.get("https://www.goldapi.io/api/XAU/USD",
+                         headers={"x-access-token": CONFIG.goldapi_key}, timeout=10)
+        if r.status_code == 200:
+            return float(r.json().get("price", 0)) or None
+    except Exception:
+        pass
+    return None
+
+def _price_matches(df: pd.DataFrame, ext_spot: Optional[float], name: str) -> bool:
+    if ext_spot is None: return True
+    if name == "YAHOO_FUTURES": return True  # basis differs; skip
+    last = float(df["close"].iloc[-1])
+    dev = abs(last - ext_spot) / ext_spot * 100
+    if dev > CONFIG.price_deviation_max_pct:
+        log.warning("⚠️ %s dev %.2f%% > %.2f%% vs ext %.2f — REJECT",
+                    name, dev, CONFIG.price_deviation_max_pct, ext_spot)
+        return False
+    log.info("✅ %s validated: dev=%.3f%% vs ext %.2f", name, dev, ext_spot)
+    return True
+
+# ── Orchestrator ────────────────────────────────────────────────────
+def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
+    ext_spot = _fetch_external_spot()
+    if ext_spot:
+        log.info("🔎 External spot: %.2f USD (Gold-API)", ext_spot)
+
+    providers = [
+        ("OANDA_V20",        _fetch_oanda),
+        ("TWELVE_DATA_SPOT", _fetch_twelvedata_multi),
+        ("FINNHUB_SPOT",     _fetch_finnhub),
+        ("YAHOO_FUTURES",    _fetch_yahoo_futures),
+    ]
+    errors = []
+    for name, fn in providers:
+        try:
+            df = fn(interval, bars)
+            df = _validate_ohlc(df, name)
+            if df is None:
+                errors.append(f"{name}: invalid"); continue
+            if not _price_matches(df, ext_spot, name):
+                errors.append(f"{name}: deviation"); continue
+            log.info("✅ Data: %s | %d bars | last=%.2f",
+                     name, len(df), float(df["close"].iloc[-1]))
+            return df, name
+        except Exception as e:
+            errors.append(f"{name}: {type(e).__name__}")
+            log.warning("Provider %s failed: %s", name, e)
+    raise RuntimeError(f"All sources failed: {'; '.join(errors)}")
 
 def sanitize_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df is None or len(df) < 2: return None
     df = df.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
     age_min = (now_utc() - df["datetime"].iloc[-1]).total_seconds() / 60
     if age_min < -1:
-        log.warning("Future timestamp detected, dropping last bar")
+        log.warning("Future timestamp — dropping last bar")
         df = df.iloc[:-1].reset_index(drop=True)
     elif age_min < CONFIG.timeframe_minutes:
         df = df.iloc[:-1].reset_index(drop=True)
@@ -344,15 +506,14 @@ def shannon_entropy(returns: np.ndarray, bins: int = 10) -> float:
     r = returns[np.isfinite(returns)]
     if len(r) < 20: return 1.0
     hist, _ = np.histogram(r, bins=bins)
-    p = hist / (hist.sum() + 1e-12)
-    p = p[p > 0]
+    p = hist / (hist.sum() + 1e-12); p = p[p > 0]
     return float(-np.sum(p * np.log2(p)) / np.log2(bins))
 
 def rolling_hurst(close: np.ndarray, window: int, stride: int) -> np.ndarray:
     n = len(close); log_s = np.log(np.maximum(close, 1e-10)); out = np.full(n, np.nan)
     for i in range(window - 1, n, stride):
         out[i] = hurst_exponent(log_s[i - window + 1 : i + 1])
-    return pd.Series(out).ffill().values  # NO bfill (P0-2 fix)
+    return pd.Series(out).ffill().values  # NO bfill (P0-2)
 
 def rolling_entropy(returns: np.ndarray, window: int, stride: int) -> np.ndarray:
     n = len(returns); out = np.full(n, np.nan)
@@ -419,8 +580,7 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         df["volume_zscore"], df["volume_ratio"] = 0.0, 1.0
 
-    hr = df["datetime"].dt.hour
-    dow = df["datetime"].dt.dayofweek
+    hr = df["datetime"].dt.hour; dow = df["datetime"].dt.dayofweek
     df["hour_sin"] = np.sin(2 * np.pi * hr / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hr / 24)
     df["dayofweek_sin"] = np.sin(2 * np.pi * dow / 7)
@@ -469,8 +629,7 @@ def purged_embargoed_cv(X: np.ndarray, y: np.ndarray, n_splits: int = 4) -> Dict
     for tr_idx, va_idx in tscv.split(X):
         purge_end = va_idx[0] - CONFIG.forward_bars
         tr_purged = tr_idx[tr_idx < purge_end]
-        if len(tr_purged) < 100: continue
-        if len(np.unique(y[tr_purged])) < 2: continue
+        if len(tr_purged) < 100 or len(np.unique(y[tr_purged])) < 2: continue
         try:
             m = build_model()
             w = np.exp(-(len(tr_purged) - 1 - np.arange(len(tr_purged))) / 500.0)
@@ -517,7 +676,6 @@ def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
     if not force:
         cached = _load_cached_model()
         if cached and cached.get("valid"): return cached
-
     df_lab = triple_barrier_labels(df_feat, CONFIG.forward_bars, CONFIG.atr_sl_multiplier)
     train_df = df_lab.iloc[: -CONFIG.forward_bars]
     X, y = train_df[FEATURES].values, train_df["label"].values
@@ -526,9 +684,8 @@ def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
     wf = purged_embargoed_cv(X, y)
     if not wf["valid"] or wf["auc_mean"] < CONFIG.min_oos_auc or wf["prec_mean"] < CONFIG.min_oos_precision:
         return {"valid": False, "reason": f"wf_gate AUC:{wf['auc_mean']:.2f} PREC:{wf['prec_mean']:.2f}"}
-
     n = len(y)
-    weights = np.exp(-(n - 1 - np.arange(n)) / 500.0)  # NEWER = HIGHER (P0-1 fix)
+    weights = np.exp(-(n - 1 - np.arange(n)) / 500.0)  # P0-1: newer = higher
     model = build_model(); model.fit(X, y, sample_weight=weights)
     out = {"valid": True, "model": model, "auc": wf["auc_mean"], "prec": wf["prec_mean"]}
     _save_cached_model(out)
@@ -593,14 +750,13 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             state["adaptive_threshold"] = new_th
 
 # ===========================================================================
-# TRADE SIZING (SR 11-7 compliant)
+# TRADE SIZING
 # ===========================================================================
 def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float,
                   source: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     last = df_feat.iloc[-1]
     price, atr = float(last["close"]), float(last["atr"])
     spread_half = CONFIG.spread_usd / 2
-
     sl_dist_raw = atr * CONFIG.atr_sl_multiplier
     tp_dist_raw = sl_dist_raw * CONFIG.risk_reward
     sl_dist_net = sl_dist_raw + CONFIG.spread_usd
@@ -612,18 +768,16 @@ def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float,
     else:
         entry = price - spread_half; sl = entry + sl_dist_net; tp = entry - tp_dist_net
 
-    risk_usd_target = CONFIG.account_equity * (CONFIG.risk_percent / 100.0)
+    risk_target = CONFIG.account_equity * (CONFIG.risk_percent / 100.0)
     sl_ticks = abs(entry - sl)
     if sl_ticks <= 0: return None
-    lot = round(risk_usd_target / (sl_ticks * CONFIG.contract_size), 2)
+    lot = round(risk_target / (sl_ticks * CONFIG.contract_size), 2)
     if lot < CONFIG.min_lot:
-        log.info("⛔ Computed lot %.4f < min_lot; risk-adjusted skip.", lot)
-        return None
+        log.info("⛔ Computed lot %.4f < min_lot; risk-adjusted skip.", lot); return None
     lot = min(lot, CONFIG.max_lot)
     actual_risk = lot * sl_ticks * CONFIG.contract_size
-    if actual_risk > risk_usd_target * 1.05:
-        log.warning("⛔ Actual risk $%.2f > target $%.2f; skip.", actual_risk, risk_usd_target)
-        return None
+    if actual_risk > risk_target * 1.05:
+        log.warning("⛔ Actual risk $%.2f > target $%.2f", actual_risk, risk_target); return None
 
     signal_id = hashlib.sha256(
         f"{sig_type}:{entry:.2f}:{now_utc().isoformat()}".encode()
@@ -660,16 +814,14 @@ def circuit_breakers_ok(state: Dict[str, Any], df_feat: pd.DataFrame) -> Tuple[b
     daily_limit = -CONFIG.max_daily_loss_pct * CONFIG.account_equity / 100.0
     if state["daily_pnl_usd"] <= daily_limit:
         return False, f"Daily loss limit ({state['daily_pnl_usd']:.2f})"
-    week_dd_limit = -CONFIG.max_weekly_drawdown_pct * CONFIG.account_equity / 100.0
-    if state["daily_pnl_usd"] <= week_dd_limit:
+    week_dd = -CONFIG.max_weekly_drawdown_pct * CONFIG.account_equity / 100.0
+    if state["daily_pnl_usd"] <= week_dd:
         return False, f"Weekly DD ({state['daily_pnl_usd']:.2f})"
     if state.get("consecutive_losses", 0) >= CONFIG.max_consecutive_losses:
         return False, f"{state['consecutive_losses']} consecutive losses"
-    atr_series = df_feat["atr"].tail(500)
-    if len(atr_series) > 100:
-        thresh = atr_series.quantile(CONFIG.extreme_atr_percentile)
-        if float(df_feat.iloc[-1]["atr"]) >= thresh:
-            return False, f"ATR tail ({CONFIG.extreme_atr_percentile*100:.1f}pct)"
+    atr_s = df_feat["atr"].tail(500)
+    if len(atr_s) > 100 and float(df_feat.iloc[-1]["atr"]) >= atr_s.quantile(CONFIG.extreme_atr_percentile):
+        return False, f"ATR > {CONFIG.extreme_atr_percentile*100:.1f}pct tail"
     return True, ""
 
 # ===========================================================================
@@ -677,13 +829,12 @@ def circuit_breakers_ok(state: Dict[str, Any], df_feat: pd.DataFrame) -> Tuple[b
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v28.0 — Institutional Hardened Edition")
+    log.info("XAUUSD v28.1 — Institutional Hardened (Multi-Source)")
     log.info("=" * 60)
 
     with FileLock(CONFIG.state_lock_path, CONFIG.state_lock_timeout_sec):
         state = load_state()
         weekly_reset_if_needed(state)
-
         if state.get("last_reset_date") != now_utc().strftime("%Y-%m-%d"):
             state["daily_signals_count"] = 0
             state["daily_pnl_usd"] = 0.0
@@ -700,16 +851,16 @@ def main():
             if df is None:
                 log.warning("⚠️ Insufficient sanitized data."); return
         except Exception as e:
-            log.error("❌ Fetch failed: %s", e); return
+            log.error("❌ All providers failed: %s", e); return
 
+        state["last_data_source"] = source
         resolve_active_signals(state, df)
         save_state(state)
 
         if state["daily_signals_count"] >= CONFIG.max_daily_signals:
-            log.info("⛔ Max daily signals reached."); return
+            log.info("⛔ Max daily signals."); return
         if state["daily_pnl_usd"] <= -(CONFIG.max_daily_loss_pct * CONFIG.account_equity / 100.0):
             log.info("⛔ Daily loss limit."); return
-
         if state.get("last_signal_time"):
             try:
                 mins = (now_utc() - datetime.fromisoformat(state["last_signal_time"])).total_seconds() / 60
@@ -719,10 +870,10 @@ def main():
 
         df_feat = calculate_features(df)
         if len(df_feat) < CONFIG.min_candles:
-            log.warning("⚠️ Insufficient features."); return
+            log.warning("⚠️ Insufficient features after NaN purge."); return
         last = df_feat.iloc[-1]
 
-        h_val = float(last["hurst"]); e_val = float(last["shannon_entropy"])
+        h_val, e_val = float(last["hurst"]), float(last["shannon_entropy"])
         log.info("📊 Regime: hurst=%.3f (min=%.2f) | entropy=%.3f (max=%.2f)",
                  h_val, CONFIG.min_hurst_threshold, e_val, CONFIG.max_entropy_threshold)
         if e_val > CONFIG.max_entropy_threshold:
@@ -759,7 +910,7 @@ def main():
         if sig_type == "SELL" and close_price > ema_trend:
             log.info("🛡️ Price > EMA50. Skip."); return
         if adx < 20.0:
-            log.info("🛡️ ADX %.1f < 20. Skip.", adx); return
+            log.info("🛡️ ADX %.1f < 20.", adx); return
         if sig_type == "BUY" and rsi > 75:
             log.info("🛡️ RSI overbought."); return
         if sig_type == "SELL" and rsi < 25:
@@ -770,12 +921,10 @@ def main():
         trade = compute_trade(sig_type, df_feat, prob, source, state)
         if trade is None:
             log.info("⛔ Trade sizing rejected."); return
-
         if trade["signal_id"] in state.get("open_signal_ids", []):
             log.warning("⚠️ Duplicate signal_id, skip."); return
-
         if not send_telegram(format_message(trade, source)):
-            log.error("❌ Telegram failed; aborting."); return
+            log.error("❌ Telegram failed; aborting state update."); return
 
         state["active_signals"].append(trade)
         state["open_signal_ids"].append(trade["signal_id"])
