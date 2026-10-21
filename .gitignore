@@ -27,3 +27,10 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+*.pkl
+*.jsonl
+.xauusd_*
+__pycache__/
+*.pyc
+.env
