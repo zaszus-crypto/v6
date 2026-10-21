@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-XAUUSD BOT v29.0 — THE PERFECT REDUNDANCY EDITION
-=================================================
+XAUUSD BOT v29.0 — THE PERFECT REDUNDANCY EDITION (FINAL)
+=========================================================
 Data Chain: TwelveData -> Deriv -> YFinance (Offset) -> OANDA
-Validation: Gold-API (Non-blocking)
-Core Logic: Institutional Hardened (v28.x) + Smart Basis Offset
+Validation: Gold-API (Terintegrasi Penuh)
 """
 
 import os, sys, json, logging, time as py_time, hashlib, fcntl, pickle, asyncio
@@ -140,7 +139,6 @@ def _default_state() -> Dict[str, Any]:
         "recent_outcomes": [], "consecutive_losses": 0,
         "week_start_equity": CONFIG.account_equity, "week_start_date": now_utc().strftime("%Y-%W"),
         "last_data_source": None, "open_signal_ids": [],
-        # 🔥 NEW: Cache for YFinance Offset
         "last_spot_price": 0.0, "last_futures_basis": 0.0 
     }
 
@@ -204,7 +202,7 @@ def send_telegram(message: str) -> bool:
     return False
 
 # ===========================================================================
-# DATA PROVIDERS
+# DATA PROVIDERS & VALIDATION
 # ===========================================================================
 REQUIRED_COLS = ["datetime", "open", "high", "low", "close", "volume"]
 
@@ -214,6 +212,26 @@ def _validate_ohlc(df: Optional[pd.DataFrame], name: str) -> Optional[pd.DataFra
     if not df["datetime"].is_monotonic_increasing: df = df.sort_values("datetime").reset_index(drop=True)
     if df[["open","high","low","close"]].isna().any().any(): return None
     return df
+
+def _fetch_external_spot() -> Optional[float]:
+    if not CONFIG.goldapi_key: return None
+    try:
+        r = requests.get("https://www.goldapi.io/api/XAU/USD", headers={"x-access-token": CONFIG.goldapi_key}, timeout=10)
+        if r.status_code == 200:
+            return float(r.json().get("price", 0)) or None
+    except Exception: pass
+    return None
+
+def _price_matches(df: pd.DataFrame, ext_spot: Optional[float], name: str) -> bool:
+    if ext_spot is None: return True
+    if name in ["YAHOO_FUTURES", "YFINANCE_OFFSET"]: return True
+    last = float(df["close"].iloc[-1])
+    dev = abs(last - ext_spot) / ext_spot * 100
+    if dev > CONFIG.price_deviation_max_pct:
+        log.warning("⚠️ %s dev %.2f%% > %.2f%% vs ext %.2f — REJECT", name, dev, CONFIG.price_deviation_max_pct, ext_spot)
+        return False
+    log.info("✅ %s validated: dev=%.3f%% vs ext %.2f", name, dev, ext_spot)
+    return True
 
 # 1. TWELVEDATA
 def _fetch_twelvedata_multi(interval: str, bars: int) -> Optional[pd.DataFrame]:
@@ -260,29 +278,24 @@ def _fetch_deriv(interval: str, bars: int) -> Optional[pd.DataFrame]:
 # 3. YFINANCE (Dynamic Offset)
 def _fetch_yfinance_offset(interval: str, bars: int, state: Dict[str, Any]) -> Optional[pd.DataFrame]:
     try:
-        # 1. Dapatkan Anchor Spot (Prioritas: State, lalu TwelveData)
         spot_anchor = state.get("last_spot_price", 0.0)
         if spot_anchor == 0.0:
             df_spot = _fetch_twelvedata_single(CONFIG.twelvedata_key, interval, 10)
             if df_spot is not None: spot_anchor = float(df_spot["close"].iloc[-1])
         
-        # 2. Ambil Data Futures dari YFinance
         period = "5d" if "min" in interval else "1mo"
         df_fut = yf.download("GC=F", period=period, interval=interval, progress=False)
         if df_fut.empty: return None
         
         last_fut = float(df_fut['Close'].iloc[-1])
-        
-        # 3. Hitung Basis
         basis = state.get("last_futures_basis", 0.0)
         if spot_anchor > 0:
             basis = last_fut - spot_anchor
-            state["last_futures_basis"] = basis # Update cache basis
+            state["last_futures_basis"] = basis
             log.info(f"🔧 YFinance Offset applied: Basis={basis:.2f} (Futures {last_fut:.2f} vs Spot {spot_anchor:.2f})")
         else:
             log.warning("⚠️ YFinance using historical basis (no fresh spot anchor)")
             
-        # 4. Sesuaikan DataFrame
         df = pd.DataFrame({
             "datetime": df_fut.index,
             "open": df_fut['Open'] - basis,
@@ -315,7 +328,6 @@ def _fetch_oanda(interval: str, bars: int) -> Optional[pd.DataFrame]:
 
 # ORCHESTRATOR
 def fetch_xauusd_data(state: Dict[str, Any], interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
-    # ✅ TAMBAHKAN BARIS INI: Ambil harga eksternal untuk validasi
     ext_spot = _fetch_external_spot()
     if ext_spot:
         log.info("🔎 External spot: %.2f USD (Gold-API)", ext_spot)
@@ -330,9 +342,7 @@ def fetch_xauusd_data(state: Dict[str, Any], interval: str = "15min", bars: int 
         try:
             df = _validate_ohlc(fn(), name)
             if df is not None:
-                # ✅ TAMBAHKAN BARIS INI: Validasi harga sebelum digunakan
-                if not _price_matches(df, ext_spot, name):
-                    continue # Tolak provider ini jika harganya aneh
+                if not _price_matches(df, ext_spot, name): continue
                 
                 state["last_spot_price"] = float(df["close"].iloc[-1])
                 log.info("✅ Data: %s | %d bars | last=%.2f", name, len(df), float(df["close"].iloc[-1]))
@@ -580,7 +590,7 @@ def circuit_breakers_ok(state: Dict[str, Any], df_feat: pd.DataFrame) -> Tuple[b
 # ===========================================================================
 def main():
     log.info("=" * 60)
-    log.info("XAUUSD v29.0 — The Perfect Redundancy Edition")
+    log.info("XAUUSD v29.0 — The Perfect Redundancy Edition (FINAL)")
     log.info("=" * 60)
 
     with FileLock(CONFIG.state_lock_path, CONFIG.state_lock_timeout_sec):
