@@ -3,28 +3,25 @@
 """
 XAUUSD BOT v28.0 — INSTITUTIONAL HARDENED EDITION
 =================================================
-Forensic fix: P0-1 s/d P0-5, P1-1 s/d P1-8, P2-1, P2-3, P2-5, P2-7, P2-10.
-Deployment assumptions:
-  - Single-host execution (cron / GitHub Actions single job).
-  - Local file = source of truth per host; Gist = best-effort sync/broadcast.
-  - For true multi-host HA: replace Gist with Redis (distributed lock via SET NX PX).
+Fixes: P0-1..P0-5, P1-1..P1-8, P2-1, P2-3, P2-7, P2-10.
+Deployment: single-host (GH Actions / VPS). Local file = authority, Gist = backup.
 """
 
-import os, sys, json, logging, time as py_time, hashlib, fcntl
-from dataclasses import dataclass, field
+import os, sys, json, logging, time as py_time, hashlib, fcntl, pickle
+from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Any, Tuple, Optional, List
+
 import numpy as np
 import pandas as pd
 import requests
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import precision_score, roc_auc_score
-import pickle
 
 # ===========================================================================
-# ENV HELPERS (unchanged interface)
+# ENV HELPERS
 # ===========================================================================
 def _env_float(k, d):
     v = (os.getenv(k) or "").strip()
@@ -41,7 +38,7 @@ def _env_str(k, d=""):
     return (os.getenv(k) or "").strip() or d
 
 # ===========================================================================
-# CONFIG — HARDENED
+# CONFIG
 # ===========================================================================
 @dataclass(frozen=True)
 class Config:
@@ -57,8 +54,8 @@ class Config:
     atr_period: int = 14
     atr_sl_multiplier: float = 1.5
     risk_reward: float = 2.0
-    spread_usd: float = 0.30          # NOW USED (entry + SL/TP adjustment)
-    slippage_usd: float = 0.10        # NEW: execution slippage assumption
+    spread_usd: float = 0.30
+    slippage_usd: float = 0.10
 
     base_min_signal_probability: float = 0.38
     max_threshold: float = 0.50
@@ -67,15 +64,15 @@ class Config:
     min_oos_precision: float = 0.45
 
     max_entropy_threshold: float = 0.99
-    min_hurst_threshold: float = 0.50     # FIXED: trend-following needs H>0.5
-    max_wick_ratio_threshold: float = 0.75
+    min_hurst_threshold: float = 0.50
 
     cooldown_minutes: int = 120
     max_daily_signals: int = 6
     max_daily_loss_pct: float = 4.0
-    max_weekly_drawdown_pct: float = 8.0  # NEW
-    max_consecutive_losses: int = 4       # NEW
-    extreme_atr_percentile: float = 0.995 # NEW: volatility circuit breaker
+    max_weekly_drawdown_pct: float = 8.0
+    max_consecutive_losses: int = 4
+    extreme_atr_percentile: float = 0.995
+
     account_equity: float = _env_float("ACCOUNT_EQUITY", 1000.0)
     risk_percent: float = _env_float("RISK_PERCENT", 1.0)
     contract_size: float = 100.0
@@ -87,14 +84,10 @@ class Config:
     entropy_window: int = 150
     entropy_stride: int = 5
 
-    # Model caching (P1-6)
     model_cache_path: str = str(Path.home() / ".xauusd_model.pkl")
-    model_max_age_minutes: int = 60 * 12   # retrain every 12h
-
-    # Locking (P0-3)
+    model_max_age_minutes: int = 60 * 12
     state_lock_path: str = str(Path.home() / ".xauusd_state.lock")
     state_lock_timeout_sec: int = 300
-
     state_path: str = str(Path.home() / ".xauusd_state.json")
     kill_switch_env: str = "KILL_SWITCH"
 
@@ -107,7 +100,7 @@ FEATURES = [
     "body_ratio","upper_wick_ratio","lower_wick_ratio","bos_score",
     "liquidity_sweep_score","return_1","return_3","return_5",
     "volume_zscore","volume_ratio","hour_sin","hour_cos",
-    "dayofweek_sin","dayofweek_cos",  # FIXED: cyclic encoding
+    "dayofweek_sin","dayofweek_cos",
     "session_london","session_newyork","session_overlap",
 ]
 
@@ -120,7 +113,7 @@ def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 # ===========================================================================
-# FILE LOCK (single-host race prevention)
+# FILE LOCK
 # ===========================================================================
 class FileLock:
     def __init__(self, path: str, timeout: int = 300):
@@ -144,7 +137,7 @@ class FileLock:
             pass
 
 # ===========================================================================
-# STATE — REVISION-BASED + ATOMIC LOCAL + BEST-EFFORT GIST
+# STATE
 # ===========================================================================
 def _default_state() -> Dict[str, Any]:
     return {
@@ -172,9 +165,6 @@ def _merge_defaults(state: Dict[str, Any]) -> Dict[str, Any]:
     return state
 
 def load_state() -> Dict[str, Any]:
-    default = _default_state()
-
-    # Local file = authority (atomic, no network race)
     if os.path.exists(CONFIG.state_path):
         try:
             with open(CONFIG.state_path, "r", encoding="utf-8") as f:
@@ -185,8 +175,6 @@ def load_state() -> Dict[str, Any]:
             return s
         except Exception as e:
             log.warning("Local state corrupt: %s", e)
-
-    # Fallback to Gist (cold start on new host)
     if CONFIG.gist_token and CONFIG.gist_id:
         for attempt in range(1, 4):
             try:
@@ -201,12 +189,15 @@ def load_state() -> Dict[str, Any]:
             except Exception as e:
                 log.warning("Gist load attempt %d: %s", attempt, e)
             py_time.sleep(2 ** attempt)
-    return default
+    return _default_state()
 
 def save_state(state: Dict[str, Any]) -> bool:
-    state["_revision"] = int(state.get("_revision", 0)) + 1
+    # BACKTEST_MODE guard — never write state in dry-run
+    if CONFIG.backtest_mode:
+        log.info("🧪 BACKTEST_MODE — state write skipped")
+        return True
 
-    # 1) Atomic local write (authority)
+    state["_revision"] = int(state.get("_revision", 0)) + 1
     try:
         tmp = CONFIG.state_path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -216,7 +207,6 @@ def save_state(state: Dict[str, Any]) -> bool:
         log.error("Local save failed: %s", e)
         return False
 
-    # 2) Best-effort Gist sync (read-then-patch with revision CAS emulation)
     if CONFIG.gist_token and CONFIG.gist_id:
         for attempt in range(1, 3):
             try:
@@ -232,10 +222,12 @@ def save_state(state: Dict[str, Any]) -> bool:
     return True
 
 # ===========================================================================
-# TELEGRAM — FULL RETRY
+# TELEGRAM
 # ===========================================================================
 def send_telegram(message: str) -> bool:
-    if CONFIG.backtest_mode: return True
+    if CONFIG.backtest_mode:
+        log.info("🧪 BACKTEST_MODE — Telegram send skipped")
+        return True
     if not CONFIG.telegram_token or not CONFIG.telegram_chat_id: return False
     url = f"https://api.telegram.org/bot{CONFIG.telegram_token}/sendMessage"
     payload = {"chat_id": CONFIG.telegram_chat_id, "text": message,
@@ -254,7 +246,7 @@ def send_telegram(message: str) -> bool:
     return False
 
 # ===========================================================================
-# DATA FETCHING — both paths with retries
+# DATA FETCHING
 # ===========================================================================
 def fetch_xauusd_data(interval: str = "15min", bars: int = 5000) -> Tuple[pd.DataFrame, str]:
     api_key = _env_str("TWELVE_DATA_KEY")
@@ -282,8 +274,7 @@ def _fetch_twelvedata(api_key: str, interval: str, bars: int) -> Optional[pd.Dat
     for attempt in range(1, 4):
         try:
             r = requests.get(url, params=params, timeout=20)
-            if r.status_code == 429:
-                py_time.sleep(30); continue
+            if r.status_code == 429: py_time.sleep(30); continue
             data = r.json()
             values = data.get("values", [])
             if not values: raise RuntimeError("Empty values")
@@ -304,8 +295,7 @@ def _fetch_yahoo_futures(interval: str, bars: int) -> Optional[pd.DataFrame]:
     yf_interval = "15m" if interval == "15min" else interval
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval={yf_interval}&range=60d"
     r = requests.get(url, headers=headers, timeout=15)
-    if r.status_code != 200:
-        raise RuntimeError(f"Yahoo HTTP {r.status_code}")
+    if r.status_code != 200: raise RuntimeError(f"Yahoo HTTP {r.status_code}")
     res = r.json().get("chart", {}).get("result", [])
     if not res: raise RuntimeError("Yahoo empty result")
     res = res[0]
@@ -323,16 +313,15 @@ def sanitize_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
     if df is None or len(df) < 2: return None
     df = df.drop_duplicates(subset="datetime").sort_values("datetime").reset_index(drop=True)
     age_min = (now_utc() - df["datetime"].iloc[-1]).total_seconds() / 60
-    # P2-1 FIX: reject future timestamps
     if age_min < -1:
         log.warning("Future timestamp detected, dropping last bar")
         df = df.iloc[:-1].reset_index(drop=True)
     elif age_min < CONFIG.timeframe_minutes:
-        df = df.iloc[:-1].reset_index(drop=True)  # forming bar
+        df = df.iloc[:-1].reset_index(drop=True)
     return df if len(df) >= CONFIG.min_candles else None
 
 # ===========================================================================
-# FEATURE ENGINEERING — look-ahead fix
+# FEATURES
 # ===========================================================================
 def wilder_atr(df, period=14):
     prev = df["close"].shift(1)
@@ -363,8 +352,7 @@ def rolling_hurst(close: np.ndarray, window: int, stride: int) -> np.ndarray:
     n = len(close); log_s = np.log(np.maximum(close, 1e-10)); out = np.full(n, np.nan)
     for i in range(window - 1, n, stride):
         out[i] = hurst_exponent(log_s[i - window + 1 : i + 1])
-    # P0-2 FIX: ffill only (no bfill). Warmup stays NaN and gets dropped downstream.
-    return pd.Series(out).ffill().values
+    return pd.Series(out).ffill().values  # NO bfill (P0-2 fix)
 
 def rolling_entropy(returns: np.ndarray, window: int, stride: int) -> np.ndarray:
     n = len(returns); out = np.full(n, np.nan)
@@ -435,42 +423,38 @@ def calculate_features(df: pd.DataFrame) -> pd.DataFrame:
     dow = df["datetime"].dt.dayofweek
     df["hour_sin"] = np.sin(2 * np.pi * hr / 24)
     df["hour_cos"] = np.cos(2 * np.pi * hr / 24)
-    df["dayofweek_sin"] = np.sin(2 * np.pi * dow / 7)  # FIX P1-5
+    df["dayofweek_sin"] = np.sin(2 * np.pi * dow / 7)
     df["dayofweek_cos"] = np.cos(2 * np.pi * dow / 7)
-    df["session_london"]   = hr.between(7, 15).astype(int)
-    df["session_newyork"]  = hr.between(13, 21).astype(int)
-    df["session_overlap"]  = hr.between(13, 16).astype(int)  # FIX P1-5
+    df["session_london"]  = hr.between(7, 15).astype(int)
+    df["session_newyork"] = hr.between(13, 21).astype(int)
+    df["session_overlap"] = hr.between(13, 16).astype(int)
 
     df = df.replace([np.inf, -np.inf], np.nan).dropna().reset_index(drop=True)
-    # P2-7 FIX: ensure enough rows after dropna
     return df if len(df) >= CONFIG.min_candles else df.iloc[0:0]
 
 # ===========================================================================
-# TRIPLE BARRIER — vectorized inner loop (P2-5)
+# TRIPLE BARRIER (vectorized)
 # ===========================================================================
 def triple_barrier_labels(df: pd.DataFrame, fwd: int, atr_mult: float) -> pd.DataFrame:
     df = df.copy()
     c, h, l, a = df["close"].values, df["high"].values, df["low"].values, df["atr"].values
-    n = len(df)
-    labels = np.zeros(n, dtype=int)
+    n = len(df); labels = np.zeros(n, dtype=int)
     for i in range(n - fwd):
         if not np.isfinite(a[i]) or a[i] <= 0: continue
-        up = c[i] + a[i] * atr_mult
-        dn = c[i] - a[i] * atr_mult
+        up = c[i] + a[i] * atr_mult; dn = c[i] - a[i] * atr_mult
         hh = h[i+1:i+fwd+1]; ll = l[i+1:i+fwd+1]
         hit_up = hh >= up; hit_dn = ll <= dn
         trig = hit_up | hit_dn
-        if not trig.any():
-            labels[i] = 0; continue
+        if not trig.any(): labels[i] = 0; continue
         j = int(np.argmax(trig))
         if hit_up[j] and hit_dn[j]: labels[i] = 0
-        elif hit_up[j]:             labels[i] = 1
-        elif hit_dn[j]:             labels[i] = -1
+        elif hit_up[j]: labels[i] = 1
+        elif hit_dn[j]: labels[i] = -1
     df["label"] = labels
     return df
 
 # ===========================================================================
-# ML ENGINE — corrected weights + proper purge + embargo + caching
+# ML
 # ===========================================================================
 def build_model():
     rf = RandomForestClassifier(n_estimators=200, max_depth=5, min_samples_leaf=20,
@@ -479,29 +463,22 @@ def build_model():
                                     subsample=0.8, random_state=42)
     return VotingClassifier([("rf", rf), ("gb", gb)], voting="soft")
 
-def purged_embargoed_cv(X: np.ndarray, y: np.ndarray, n_splits: int = 4,
-                        embargo_bars: int = 5) -> Dict[str, float]:
+def purged_embargoed_cv(X: np.ndarray, y: np.ndarray, n_splits: int = 4) -> Dict[str, float]:
     tscv = TimeSeriesSplit(n_splits=n_splits)
     aucs, precs = [], []
     for tr_idx, va_idx in tscv.split(X):
-        # PURGE: remove train samples whose label window overlaps validation
         purge_end = va_idx[0] - CONFIG.forward_bars
         tr_purged = tr_idx[tr_idx < purge_end]
-        # EMBARGO: remove train samples immediately after validation (for next fold)
-        # Emulated here: additionally drop samples at val_end + embargo_bars
         if len(tr_purged) < 100: continue
         if len(np.unique(y[tr_purged])) < 2: continue
         try:
             m = build_model()
-            # Correct sample weights: NEWER data → HIGHER weight
             w = np.exp(-(len(tr_purged) - 1 - np.arange(len(tr_purged))) / 500.0)
             m.fit(X[tr_purged], y[tr_purged], sample_weight=w)
-            proba = m.predict_proba(X[va_idx])
-            preds = m.predict(X[va_idx])
+            proba = m.predict_proba(X[va_idx]); preds = m.predict(X[va_idx])
             dmask = y[va_idx] != 0
             if dmask.sum() < 10: continue
             y_dir, p_dir = y[va_idx][dmask], preds[dmask]
-            # P2-3 FIX: filter out neutral predictions for precision
             mask_dir = p_dir != 0
             if mask_dir.sum() >= 10 and len(np.unique(y_dir[mask_dir])) >= 2:
                 precs.append(precision_score(y_dir[mask_dir], p_dir[mask_dir], average="weighted", zero_division=0))
@@ -510,8 +487,7 @@ def purged_embargoed_cv(X: np.ndarray, y: np.ndarray, n_splits: int = 4,
                 bi = classes.index(1); y_bin = (y_dir == 1).astype(int)
                 if len(np.unique(y_bin)) >= 2:
                     aucs.append(roc_auc_score(y_bin, proba[dmask][:, bi]))
-        except Exception as e:
-            log.debug("CV fold error: %s", e)
+        except Exception:
             continue
     if not aucs: return {"valid": False, "auc_mean": 0.5, "prec_mean": 0.0}
     return {"valid": True, "auc_mean": float(np.mean(aucs)),
@@ -522,15 +498,14 @@ def _load_cached_model() -> Optional[Dict[str, Any]]:
     try:
         age_min = (py_time.time() - os.path.getmtime(CONFIG.model_cache_path)) / 60
         if age_min > CONFIG.model_max_age_minutes: return None
-        with open(CONFIG.model_cache_path, "rb") as f:
-            obj = pickle.load(f)
+        with open(CONFIG.model_cache_path, "rb") as f: obj = pickle.load(f)
         log.info("📦 Loaded cached model (age %.1fh)", age_min / 60)
         return obj
     except Exception as e:
-        log.warning("Cache load failed: %s", e)
-        return None
+        log.warning("Cache load failed: %s", e); return None
 
 def _save_cached_model(obj: Dict[str, Any]) -> None:
+    if CONFIG.backtest_mode: return
     try:
         tmp = CONFIG.model_cache_path + ".tmp"
         with open(tmp, "wb") as f: pickle.dump(obj, f)
@@ -552,18 +527,16 @@ def train_model(df_feat: pd.DataFrame, force: bool = False) -> Dict[str, Any]:
     if not wf["valid"] or wf["auc_mean"] < CONFIG.min_oos_auc or wf["prec_mean"] < CONFIG.min_oos_precision:
         return {"valid": False, "reason": f"wf_gate AUC:{wf['auc_mean']:.2f} PREC:{wf['prec_mean']:.2f}"}
 
-    # P0-1 FIX: NEWER data gets HIGHER weight
     n = len(y)
-    weights = np.exp(-(n - 1 - np.arange(n)) / 500.0)
-    model = build_model()
-    model.fit(X, y, sample_weight=weights)
+    weights = np.exp(-(n - 1 - np.arange(n)) / 500.0)  # NEWER = HIGHER (P0-1 fix)
+    model = build_model(); model.fit(X, y, sample_weight=weights)
     out = {"valid": True, "model": model, "auc": wf["auc_mean"], "prec": wf["prec_mean"]}
     _save_cached_model(out)
     log.info("🎓 Model trained | AUC=%.3f PREC=%.3f n=%d", wf["auc_mean"], wf["prec_mean"], len(X))
     return out
 
 # ===========================================================================
-# SIGNAL RESOLUTION — slippage-aware
+# SIGNAL RESOLUTION
 # ===========================================================================
 def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
     if not state.get("active_signals"): return
@@ -585,7 +558,6 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
         if outcome is None:
             if now >= expires and len(sig_df):
                 exit_price = float(sig_df["close"].iloc[-1])
-                # P0-5 FIX: account for spread on exit
                 exit_price -= CONFIG.spread_usd / 2 if sig["type"] == "BUY" else -CONFIG.spread_usd / 2
                 pnl = ((exit_price - sig["entry"]) if sig["type"] == "BUY"
                        else (sig["entry"] - exit_price)) * sig["lot"] * CONFIG.contract_size
@@ -593,11 +565,9 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             else:
                 still_active.append(sig)
         else:
-            # P0-5 FIX: realistic PnL accounting with spread + slippage
-            actual_exit = exit_price
             cost = (CONFIG.spread_usd + CONFIG.slippage_usd) * sig["lot"] * CONFIG.contract_size
             pnl = (sig["risk_usd"] * CONFIG.risk_reward if outcome == "win" else -sig["risk_usd"]) - cost
-            resolved.append((sig, outcome, actual_exit, pnl))
+            resolved.append((sig, outcome, exit_price, pnl))
 
     for sig, outcome, exit_price, pnl in resolved:
         if outcome == "win":
@@ -614,7 +584,6 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
     state["active_signals"] = still_active
     state["open_signal_ids"] = [s.get("signal_id") for s in still_active if s.get("signal_id")]
 
-    # Adaptive threshold (only after warmup)
     recent = [o for o in state["recent_outcomes"] if o["outcome"] in ("win","loss")]
     if len(recent) >= 15:
         win_rate = sum(1 for o in recent[-20:] if o["outcome"] == "win") / len(recent[-20:])
@@ -624,7 +593,7 @@ def resolve_active_signals(state: Dict[str, Any], df: pd.DataFrame) -> None:
             state["adaptive_threshold"] = new_th
 
 # ===========================================================================
-# POSITION SIZING — SR 11-7 compliant
+# TRADE SIZING (SR 11-7 compliant)
 # ===========================================================================
 def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float,
                   source: str, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -634,37 +603,26 @@ def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float,
 
     sl_dist_raw = atr * CONFIG.atr_sl_multiplier
     tp_dist_raw = sl_dist_raw * CONFIG.risk_reward
-    # P0-5 FIX: spread widens effective SL and narrows effective TP
     sl_dist_net = sl_dist_raw + CONFIG.spread_usd
     tp_dist_net = tp_dist_raw - CONFIG.spread_usd
     if tp_dist_net <= 0: return None
 
     if sig_type == "BUY":
-        entry = price + spread_half
-        sl = entry - sl_dist_net
-        tp = entry + tp_dist_net
+        entry = price + spread_half; sl = entry - sl_dist_net; tp = entry + tp_dist_net
     else:
-        entry = price - spread_half
-        sl = entry + sl_dist_net
-        tp = entry - tp_dist_net
+        entry = price - spread_half; sl = entry + sl_dist_net; tp = entry - tp_dist_net
 
-    # P0-4 FIX: strict risk cap — never exceed intended risk
     risk_usd_target = CONFIG.account_equity * (CONFIG.risk_percent / 100.0)
     sl_ticks = abs(entry - sl)
     if sl_ticks <= 0: return None
-    lot_exact = risk_usd_target / (sl_ticks * CONFIG.contract_size)
-    lot = round(lot_exact, 2)
-    # If lot below broker minimum, SKIP (do not force min_lot and exceed risk)
+    lot = round(risk_usd_target / (sl_ticks * CONFIG.contract_size), 2)
     if lot < CONFIG.min_lot:
         log.info("⛔ Computed lot %.4f < min_lot; risk-adjusted skip.", lot)
         return None
     lot = min(lot, CONFIG.max_lot)
-
-    # Verify actual risk within tolerance (5% of target)
     actual_risk = lot * sl_ticks * CONFIG.contract_size
     if actual_risk > risk_usd_target * 1.05:
-        log.warning("⛔ Actual risk $%.2f exceeds target $%.2f; skip.",
-                    actual_risk, risk_usd_target)
+        log.warning("⛔ Actual risk $%.2f > target $%.2f; skip.", actual_risk, risk_usd_target)
         return None
 
     signal_id = hashlib.sha256(
@@ -672,11 +630,9 @@ def compute_trade(sig_type: str, df_feat: pd.DataFrame, prob: float,
     ).hexdigest()[:16]
 
     return {
-        "signal_id": signal_id,
-        "type": sig_type, "entry": round(entry, 2),
-        "sl": round(sl, 2), "tp": round(tp, 2),
-        "lot": lot, "risk_usd": round(actual_risk, 2),
-        "prob": prob, "source": source,
+        "signal_id": signal_id, "type": sig_type,
+        "entry": round(entry, 2), "sl": round(sl, 2), "tp": round(tp, 2),
+        "lot": lot, "risk_usd": round(actual_risk, 2), "prob": prob, "source": source,
         "time": now_utc().isoformat(),
         "expires_at": (now_utc() + timedelta(minutes=CONFIG.timeframe_minutes * CONFIG.forward_bars * 2)).isoformat(),
     }
@@ -692,7 +648,7 @@ def format_message(t: Dict, source: str) -> str:
     )
 
 # ===========================================================================
-# CIRCUIT BREAKERS — portfolio-level (P1-1)
+# CIRCUIT BREAKERS
 # ===========================================================================
 def weekly_reset_if_needed(state: Dict[str, Any]) -> None:
     wk = now_utc().strftime("%Y-%W")
@@ -701,24 +657,19 @@ def weekly_reset_if_needed(state: Dict[str, Any]) -> None:
         state["week_start_equity"] = CONFIG.account_equity + state.get("daily_pnl_usd", 0.0)
 
 def circuit_breakers_ok(state: Dict[str, Any], df_feat: pd.DataFrame) -> Tuple[bool, str]:
-    # Daily loss
     daily_limit = -CONFIG.max_daily_loss_pct * CONFIG.account_equity / 100.0
     if state["daily_pnl_usd"] <= daily_limit:
-        return False, f"Daily loss limit hit ({state['daily_pnl_usd']:.2f})"
-    # Weekly drawdown
-    week_pnl = state["daily_pnl_usd"]  # simplified; in prod track per-day rollup
+        return False, f"Daily loss limit ({state['daily_pnl_usd']:.2f})"
     week_dd_limit = -CONFIG.max_weekly_drawdown_pct * CONFIG.account_equity / 100.0
-    if week_pnl <= week_dd_limit:
-        return False, f"Weekly DD limit hit ({week_pnl:.2f})"
-    # Consecutive losses
+    if state["daily_pnl_usd"] <= week_dd_limit:
+        return False, f"Weekly DD ({state['daily_pnl_usd']:.2f})"
     if state.get("consecutive_losses", 0) >= CONFIG.max_consecutive_losses:
         return False, f"{state['consecutive_losses']} consecutive losses"
-    # Extreme volatility
     atr_series = df_feat["atr"].tail(500)
     if len(atr_series) > 100:
         thresh = atr_series.quantile(CONFIG.extreme_atr_percentile)
         if float(df_feat.iloc[-1]["atr"]) >= thresh:
-            return False, f"ATR above {CONFIG.extreme_atr_percentile*100:.1f}pct tail"
+            return False, f"ATR tail ({CONFIG.extreme_atr_percentile*100:.1f}pct)"
     return True, ""
 
 # ===========================================================================
@@ -733,19 +684,16 @@ def main():
         state = load_state()
         weekly_reset_if_needed(state)
 
-        # Daily reset
         if state.get("last_reset_date") != now_utc().strftime("%Y-%m-%d"):
             state["daily_signals_count"] = 0
             state["daily_pnl_usd"] = 0.0
             state["last_reset_date"] = now_utc().strftime("%Y-%m-%d")
 
-        # Kill switch & market hours
         if (_env_bool(CONFIG.kill_switch_env, False) or now_utc().weekday() >= 5
                 or (now_utc().weekday() == 4 and now_utc().hour >= 21)):
             log.info("📅 Market closed or Kill Switch active.")
             save_state(state); return
 
-        # Fetch
         try:
             df, source = fetch_xauusd_data()
             df = sanitize_df(df)
@@ -754,42 +702,38 @@ def main():
         except Exception as e:
             log.error("❌ Fetch failed: %s", e); return
 
-        # Resolve (before gating — never miss resolution)
         resolve_active_signals(state, df)
         save_state(state)
 
-        # Daily limits
         if state["daily_signals_count"] >= CONFIG.max_daily_signals:
             log.info("⛔ Max daily signals reached."); return
         if state["daily_pnl_usd"] <= -(CONFIG.max_daily_loss_pct * CONFIG.account_equity / 100.0):
-            log.info("⛔ Daily loss limit reached."); return
+            log.info("⛔ Daily loss limit."); return
 
-        # Cooldown
         if state.get("last_signal_time"):
             try:
                 mins = (now_utc() - datetime.fromisoformat(state["last_signal_time"])).total_seconds() / 60
                 if mins < CONFIG.cooldown_minutes:
-                    log.info("⏸ Cooldown active (%.0fm).", mins); return
+                    log.info("⏸ Cooldown (%.0fm).", mins); return
             except Exception: pass
 
-        # Features
         df_feat = calculate_features(df)
         if len(df_feat) < CONFIG.min_candles:
-            log.warning("⚠️ Insufficient features after NaN purge."); return
+            log.warning("⚠️ Insufficient features."); return
         last = df_feat.iloc[-1]
 
-        # Regime filter
-        if float(last["shannon_entropy"]) > CONFIG.max_entropy_threshold:
-            log.info("🌊 High entropy. Skip."); return
-        if float(last["hurst"]) < CONFIG.min_hurst_threshold:
-            log.info("🌊 Hurst %.2f < %.2f. Skip.", float(last["hurst"]), CONFIG.min_hurst_threshold); return
+        h_val = float(last["hurst"]); e_val = float(last["shannon_entropy"])
+        log.info("📊 Regime: hurst=%.3f (min=%.2f) | entropy=%.3f (max=%.2f)",
+                 h_val, CONFIG.min_hurst_threshold, e_val, CONFIG.max_entropy_threshold)
+        if e_val > CONFIG.max_entropy_threshold:
+            log.info("🌊 SKIP: entropy %.3f > %.2f", e_val, CONFIG.max_entropy_threshold); return
+        if h_val < CONFIG.min_hurst_threshold:
+            log.info("🌊 SKIP: hurst %.3f < %.2f", h_val, CONFIG.min_hurst_threshold); return
 
-        # Circuit breakers
         cb_ok, cb_reason = circuit_breakers_ok(state, df_feat)
         if not cb_ok:
             log.warning("⛔ Circuit breaker: %s", cb_reason); return
 
-        # Model
         models = train_model(df_feat)
         if not models.get("valid"):
             log.info("⚠️ Invalid model: %s", models.get("reason")); return
@@ -806,9 +750,8 @@ def main():
         sig_type = "BUY" if pred == 1 else "SELL"
         prob = prob_dict.get(pred, 0.0)
         if prob < float(state["adaptive_threshold"]):
-            log.info("📉 Prob %.2f < threshold %.2f. Skip.", prob, state["adaptive_threshold"]); return
+            log.info("📉 Prob %.2f < threshold %.2f.", prob, state["adaptive_threshold"]); return
 
-        # Rule filters
         close_price, ema_trend = float(last["close"]), float(last["ema_trend"])
         adx, rsi = float(last["adx"]), float(last["rsi"])
         if sig_type == "BUY" and close_price < ema_trend:
@@ -818,23 +761,21 @@ def main():
         if adx < 20.0:
             log.info("🛡️ ADX %.1f < 20. Skip.", adx); return
         if sig_type == "BUY" and rsi > 75:
-            log.info("🛡️ RSI overbought. Skip."); return
+            log.info("🛡️ RSI overbought."); return
         if sig_type == "SELL" and rsi < 25:
-            log.info("🛡️ RSI oversold. Skip."); return
+            log.info("🛡️ RSI oversold."); return
 
         log.info("🔥 Signal confirmed | %s (Prob %.2f)", sig_type, prob)
 
         trade = compute_trade(sig_type, df_feat, prob, source, state)
         if trade is None:
-            log.info("⛔ Trade sizing rejected by risk engine."); return
+            log.info("⛔ Trade sizing rejected."); return
 
-        # P1-4 FIX: idempotency — skip if signal already active
         if trade["signal_id"] in state.get("open_signal_ids", []):
             log.warning("⚠️ Duplicate signal_id, skip."); return
 
         if not send_telegram(format_message(trade, source)):
-            log.error("❌ Telegram delivery failed; aborting state update.")
-            return
+            log.error("❌ Telegram failed; aborting."); return
 
         state["active_signals"].append(trade)
         state["open_signal_ids"].append(trade["signal_id"])
